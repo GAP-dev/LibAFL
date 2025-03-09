@@ -1,0 +1,20 @@
+[package]
+name = "tinyinst"
+authors = ["biazo <mail@elbiazo.com>", "Dongjia Zhang <toka@aflplus.plus>", "Dominik Maier <domenukk@gmail.com>"]
+description = "Rust bindings for googleprojectzero/TinyInst"
+repository = "https://github.com/AFLplusplus/tinyinst-rs/"
+readme = "./README.md"
+license = "MIT OR Apache-2.0"
+keywords = ["bindings", "testing", "security"]
+version = "0.1.0"
+edition = "2021"
+categories = ["development-tools::testing", "os", "no-std"]
+
+[dependencies]
+cxx = { version = "1.0", default-features = false, features = ["alloc"] }
+cxxbridge-macro = "1.0.143"
+
+[build-dependencies]
+cmake = "0.1"
+git2 = "0.16.0"
+which = "4.3.0"

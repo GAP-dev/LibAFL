@@ -1,0 +1,7 @@
+/target
+/Cargo.lock
+build/
+*.exe
+/TinyInst
+*.obj
+test_file.txt

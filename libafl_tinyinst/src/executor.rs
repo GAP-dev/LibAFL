@@ -155,8 +155,28 @@ where
         }
 
 
-        match status {
-            RunResult::CRASH | RunResult::HANG => Ok(ExitKind::Crash),
+        let mut retry_count = 0;
+        let mut final_status = status;
+
+        while matches!(final_status, RunResult::CRASH | RunResult::HANG) && retry_count < 3 {
+            println!("[DEBUG] RunResult::{:?} 발생, 재시도 중... ({}/{})", final_status, retry_count + 1, 4);
+            retry_count += 1;
+            unsafe {
+                final_status = self.tinyinst.run();
+                self.tinyinst
+                    .vec_coverage(self.coverage_ptr.as_mut().unwrap(), false);
+            }
+        }
+
+        match final_status {
+            RunResult::CRASH | RunResult::HANG if retry_count == 3 => {
+                println!("[DEBUG] 4회 모두 CRASH/HANG 발생, Crash로 처리");
+                Ok(ExitKind::Crash)
+            }
+            RunResult::CRASH | RunResult::HANG => {
+                println!("[DEBUG] 재시도 도중 상태 변경됨, Crash 아님");
+                Ok(ExitKind::Ok)
+            }
             RunResult::OK => Ok(ExitKind::Ok),
             RunResult::OTHER_ERROR => Err(Error::unknown(
                 "Tinyinst RunResult is other error".to_string(),

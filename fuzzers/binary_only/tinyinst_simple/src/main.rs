@@ -1,4 +1,10 @@
-use std::{fs, path::PathBuf, sync::atomic::AtomicBool, time::Duration, sync::Arc, sync::Mutex};
+use std::{
+    fs,
+    path::PathBuf,
+    sync::atomic::AtomicBool,
+    time::Duration,
+    sync::{Arc, Mutex},
+};
 
 use libafl::state::{HasCorpus, HasSolutions};
 use libafl::{
@@ -43,13 +49,15 @@ fn monitor_callback(x: &str) {
 
 #[cfg(any(target_vendor = "apple", windows, target_os = "linux"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 설정
     let tinyinst_args = vec!["-instrument_module".to_string(), "ImageIO".to_string()];
     let args = vec![
         "/Users/gap_dev/fuzz_jack/Jackalope/build/examples/ImageIO/Release/test_imageio".to_string(),
         "-f".to_string(),
         "@@".to_string(),
     ];
-    
+
+    // 커버리지 버퍼
     let mut coverage = OwnedMutPtr::Ptr(unsafe { &mut COVERAGE });
     let observer = ListObserver::new("cov", coverage.clone());
     let mut feedback = ListFeedback::new(&observer);
@@ -62,19 +70,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rand = StdRand::new();
     let corpus_path = PathBuf::from("../../corpus_discovered");
 
-    // 숨김 파일 (.으로 시작하는 파일) 제거
+    // corpus 디렉토리 내 숨김 파일 제거
     for entry in fs::read_dir(&corpus_path)? {
         if let Ok(entry) = entry {
             let path = entry.path();
             if let Some(filename) = path.file_name().and_then(|name| name.to_str()) {
                 if filename.starts_with('.') {
-                    fs::remove_file(path)?; // 숨김 파일 삭제
+                    fs::remove_file(path)?;
                 }
             }
         }
     }
 
-    // InMemoryCorpus 생성 후, 디스크의 기존 파일 불러오기
+    // InMemoryCorpus 생성 후 디스크에서 seed 입력 불러오기
     let mut corpus: MyCorpus<BytesInput> = MyCorpus(InMemoryCorpus::new());
     if let Ok(entries) = fs::read_dir(&corpus_path) {
         for entry in entries.flatten() {
@@ -87,18 +95,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if corpus.0.count() == 0 {
         corpus.0.add(Testcase::new(BytesInput::new(Vec::new())))?;
     }
-    // 공유 corpus로 래핑 (Arc<Mutex<...>>)
+    // 공유 corpus를 Arc<Mutex<>>로 관리
     let shared_corpus = Arc::new(Mutex::new(corpus));
 
     let solutions = OnDiskCorpus::new(PathBuf::from("./crashes"))?;
     let mut objective = CrashFeedback::new();
-    // 메인 state는 공유 corpus의 복사본으로 생성 (내부 corpus 사용)
+    // 메인 state는 공유 corpus의 복사본으로 생성
     let mut state = StdState::new(rand, (*shared_corpus.lock().unwrap()).clone().0, solutions, &mut feedback, &mut objective)?;
     let scheduler: RandScheduler<StdState<InMemoryCorpus<BytesInput>, BytesInput, StdRand, OnDiskCorpus<BytesInput>>> = RandScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
     let monitor = SimpleMonitor::new(monitor_callback as fn(&str));
-    let mut mgr: SimpleEventManager<BytesInput, SimpleMonitor<fn(&str)>, StdState<InMemoryCorpus<BytesInput>, BytesInput, StdRand, OnDiskCorpus<BytesInput>>> = SimpleEventManager::new(monitor);
+    let mut mgr: SimpleEventManager<BytesInput, SimpleMonitor<fn(&str)>, StdState<InMemoryCorpus<BytesInput>, BytesInput, StdRand, OnDiskCorpus<BytesInput>>> =
+        SimpleEventManager::new(monitor);
     let mut executor = TinyInstExecutor::builder()
         .tinyinst_args(tinyinst_args.clone())
         .program_args(args.clone())
@@ -111,14 +120,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))?;
 
     use std::thread;
-
-    let n = 10; // Number of threads
-
+    let n = 10; // 쓰레드 수
     let mut round: usize = 0;
     
     loop {
         println!("=== Fuzzing Round {round} ===");
-
         let mut handles = vec![];
 
         for _ in 0..n {
@@ -127,12 +133,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let args = args.clone();
 
             let handle = thread::spawn(move || {
-                // 각 스레드는 공유 corpus의 복사본을 사용하여 state를 생성
+                // 공유 corpus의 복사본으로 state 생성
                 let corpus_for_state = {
                     let guard = shared_corpus_clone.lock().unwrap();
                     guard.clone().0
                 };
-                let mut local_feedback = ListFeedback::new(&ListObserver::new("cov", OwnedMutPtr::Ptr(Box::leak(Box::new(Vec::<u64>::new())))));
+                let mut local_feedback = ListFeedback::new(&ListObserver::new(
+                    "cov",
+                    OwnedMutPtr::Ptr(Box::leak(Box::new(Vec::<u64>::new())))
+                ));
                 let mut local_objective = CrashFeedback::new();
 
                 #[cfg(windows)]
@@ -141,13 +150,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _shmem_provider = UnixShMemProvider::new().unwrap();
 
                 let rand = StdRand::new();
-                let mut local_state = StdState::new(rand, corpus_for_state, OnDiskCorpus::new(PathBuf::from("./crashes")).unwrap(), &mut local_feedback, &mut local_objective).unwrap();
+                let mut local_state = StdState::new(
+                    rand,
+                    corpus_for_state,
+                    OnDiskCorpus::new(PathBuf::from("./crashes")).unwrap(),
+                    &mut local_feedback,
+                    &mut local_objective,
+                ).unwrap();
 
                 let scheduler = RandScheduler::new();
                 let mut local_fuzzer = StdFuzzer::new(scheduler, local_feedback, local_objective);
                 let local_monitor = SimpleMonitor::new(|x| println!("{x}"));
                 let mut local_mgr = SimpleEventManager::new(local_monitor);
 
+                // 각 스레드 전용 coverage
                 let mut coverage = OwnedMutPtr::Ptr(Box::leak(Box::new(Vec::<u64>::new())));
                 let observer = ListObserver::new("cov", coverage.clone());
                 let mut local_executor = TinyInstExecutor::builder()
@@ -164,13 +180,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 local_fuzzer.fuzz_one(&mut stages, &mut local_executor, &mut local_state, &mut local_mgr).unwrap();
 
-                // 업데이트: local_state의 corpus를 공유 corpus에 반영
+                // 공유 corpus 업데이트: local_state의 corpus를 공유 corpus에 반영
                 {
                     let mut guard = shared_corpus_clone.lock().unwrap();
                     *guard = MyCorpus(local_state.corpus().clone());
                 }
-                println!("Thread done. Corpus: {}, Solutions: {}, Coverage entries: {}",
-                    local_state.corpus().count(), local_state.solutions().count(), coverage.as_ref().len());
+                println!(
+                    "Thread done. Corpus: {}, Solutions: {}, Coverage entries: {}",
+                    local_state.corpus().count(),
+                    local_state.solutions().count(),
+                    coverage.as_ref().len()
+                );
             });
 
             handles.push(handle);
@@ -181,20 +201,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         println!("=== Round {round} Complete ===\n");
-
         round += 1;
     }
 
-    println!("\n===== DEBUG INFO =====");
-    println!("Corpus count: {}", state.corpus().count());
-    println!("Solutions count: {}", state.solutions().count());
-    println!("Coverage entries: {}", unsafe { COVERAGE.len() });
-    println!("DEBUG TYPE INFO (compile-time known types):");
-    println!("Stages: StdMutationalStage with multiple generic parameters");
-    println!("Executor: TinyInstExecutor<S, SHM, OT> (generic, see source)");
-    println!("State: StdState<R, C, S, O> (generic, see source)");
-    println!("EventManager: SimpleEventManager<SimpleMonitor>");
-    println!("======================\n");
+    // 아래 코드는 무한 루프 이후 실행되지 않습니다.
+    // println!("\n===== DEBUG INFO =====");
+    // println!("Corpus count: {}", state.corpus().count());
+    // println!("Solutions count: {}", state.solutions().count());
+    // println!("Coverage entries: {}", unsafe { COVERAGE.len() });
+    // println!("DEBUG TYPE INFO (compile-time known types):");
+    // println!("Stages: StdMutationalStage with multiple generic parameters");
+    // println!("Executor: TinyInstExecutor<S, SHM, OT> (generic, see source)");
+    // println!("State: StdState<R, C, S, O> (generic, see source)");
+    // println!("EventManager: SimpleEventManager<SimpleMonitor>");
+    // println!("======================\n");
 
-    Ok(())
+    // Ok(())
 }

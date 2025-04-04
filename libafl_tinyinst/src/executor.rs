@@ -56,6 +56,7 @@ where
     I: HasTargetBytes,
     SHM: ShMem,
 {
+    
     #[inline]
     fn run_target(
         &mut self,
@@ -90,74 +91,35 @@ where
                 .vec_coverage(self.coverage_ptr.as_mut().unwrap(), false);
         }
     
-        // 🔥 디버깅: 커버리지 데이터 출력
-     /*   unsafe {
-            if let Some(coverage_data) = self.coverage_ptr.as_ref() {
-                if coverage_data.is_empty() {
-                    println!("[DEBUG] 커버리지 데이터 없음");
-                } else {
-                    println!("[DEBUG] 현재 커버리지 데이터: {:?}", coverage_data);
-                }
-            } else {
-                println!("[DEBUG] coverage_ptr가 NULL입니다.");
-            }
-        }
-     */
-        
-        // 🔥 커버리지 데이터 누적 저장
-     /*  unsafe {
-            if let Some(coverage_data) = self.coverage_ptr.as_ref() {
-                if coverage_data.is_empty() {
-                  //  println!("[DEBUG] 커버리지 데이터 없음");
-                } else {
-                    // 새로운 offset을 기존 set에 추가
-                    for &addr in coverage_data.iter() {
-                        self.hit_offsets.insert(addr);
-                    }
-                   // println!("[DEBUG] Hit Offsets: {:?}", self.hit_offsets);
-                    println!("[DEBUG] 총 히트된 offset 개수: {}", self.hit_offsets.len());
-                }
-            } else {
-                println!("[DEBUG] coverage_ptr가 NULL입니다.");
-            }
-        } */ 
-
-
-        // 🔥 기존 `hit_offsets`과 비교하여 새로운 offset만 추가
-
-
-        
+        // 신규 offset 처리: Executor 내부 hit_offsets에 새로운 offset 추가 후 로그 출력
         unsafe {
             if let Some(coverage_data) = self.coverage_ptr.as_ref() {
-                if coverage_data.is_empty() {
-                   // println!("[DEBUG] 커버리지 데이터 없음");
-                } else {
+                if !coverage_data.is_empty() {
                     let old_count = self.hit_offsets.len();
                     let mut new_hits = Vec::new();
-
+    
                     for &addr in coverage_data.iter() {
-                        if self.hit_offsets.insert(addr) { // 🔥 Set에 추가 시, 중복이면 false 반환
-                            new_hits.push(addr); // 새로운 히트만 저장
+                        if self.hit_offsets.insert(addr) {
+                            new_hits.push(addr);
                         }
                     }
-
+    
                     let new_count = self.hit_offsets.len() - old_count;
-
+    
                     if !new_hits.is_empty() {
-                        println!("[DEBUG] 신규 발견된 Offset: {:?}", new_hits);
+                  //      println!("[DEBUG] Executor - 신규 offset 발견: {:?}", new_hits);
                     }
-                    println!("[DEBUG] 이번 실행에서 추가된 offset 개수: {}", new_count);
-                    println!("[DEBUG] 총 히트된 offset 개수: {}", self.hit_offsets.len());
+                    println!("[DEBUG] Executor - 이번 실행에서 추가된 offset 개수: {}", new_count);
+                    println!("[DEBUG] Executor - 총 hit된 offset 개수: {}", self.hit_offsets.len());
                 }
             } else {
-                println!("[DEBUG] coverage_ptr가 NULL입니다.");
+                println!("[DEBUG] Executor - coverage_ptr가 NULL입니다.");
             }
         }
-
-
+    
         let mut retry_count = 0;
         let mut final_status = status;
-
+    
         while matches!(final_status, RunResult::CRASH | RunResult::HANG) && retry_count < 3 {
             println!("[DEBUG] RunResult::{:?} 발생, 재시도 중... ({}/{})", final_status, retry_count + 1, 4);
             retry_count += 1;
@@ -167,7 +129,7 @@ where
                     .vec_coverage(self.coverage_ptr.as_mut().unwrap(), false);
             }
         }
-
+        
         match final_status {
             RunResult::CRASH | RunResult::HANG if retry_count == 3 => {
                 println!("[DEBUG] 4회 모두 CRASH/HANG 발생, Crash로 처리");
@@ -178,13 +140,13 @@ where
                 Ok(ExitKind::Ok)
             }
             RunResult::OK => Ok(ExitKind::Ok),
-            RunResult::OTHER_ERROR => Err(Error::unknown(
-                "Tinyinst RunResult is other error".to_string(),
-            )),
+            RunResult::OTHER_ERROR => Err(Error::unknown("Tinyinst RunResult is other error".to_string())),
             _ => Err(Error::unknown("Tinyinst RunResult is unknown".to_string())),
         }
     }
+    
 }
+
 
 /// Builder for `TinyInstExecutor`
 #[derive(Debug)]

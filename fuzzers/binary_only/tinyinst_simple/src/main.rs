@@ -14,6 +14,7 @@ use libafl::{
     Fuzzer, StdFuzzer,
  
 };
+use libafl_bolts::shmem::{ServedShMemProvider, MmapShMemProvider};
 #[cfg(unix)]
 use libafl_bolts::shmem::UnixShMemProvider;
 #[cfg(windows)]
@@ -61,8 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // shmem_provider 초기화
 
-    let mut shmem_provider = UnixShMemProvider::new()?;
-    
+    ///let mut shmem_provider = UnixShMemProvider::new()?;
+    let mut shmem_provider = ServedShMemProvider::<MmapShMemProvider>::new()?;
+
+
+
     // 병렬 처리할 코어와 브로커 포트 지정
     let forks = 10; // 예시: 4개의 프로세스 사용
     let cores = Cores::from((0..forks).collect::<Vec<_>>());
@@ -130,8 +134,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         })
         .cores(&cores)
-        //.broker_port(broker_port)
-        //.stdout_file(Some("/dev/null"))
+        .broker_port(broker_port)
+        .stdout_file(Some("/dev/null"))
         .build() // 여기서 ?를 제거
         .launch::<BytesInput, ()>()?;
     

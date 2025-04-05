@@ -502,31 +502,22 @@ where
         let response = match request {
             ServedShMemRequest::Hello() => Ok(ServedShMemResponse::Id(client_id)),
             ServedShMemRequest::PreFork() => {
-                // We clone the provider already, waiting for it to reconnect [`PostFork`].
-                // That wa, even if the parent dies before the child sends its `PostFork`, we should be good.
-                // See issue https://github.com/AFLplusplus/LibAFL/issues/276
-                //let forking_client = self.clients[&client_id].maps.clone();
-                self.forking_clients
-                    .insert(client_id, self.clients[&client_id].maps.clone());
-                // Technically, no need to send the client_id here but it keeps the code easier.
-
-                /*
-                // remove temporarily
-                let client = self.clients.remove(&client_id);
-                let mut forking_shmems = HashMap::new();
-                for (id, map) in client.as_ref().unwrap().maps.iter() {
-                    forking_shmems.insert(*id, map.clone());
-                }
-                self.forking_clients.insert(client_id, forking_shmems);
-                self.clients.insert(client_id, client.unwrap());
-                */
-
+                // 클라이언트의 기존 매핑 정보를 forking_clients에 저장
+                self.forking_clients.insert(client_id, self.clients[&client_id].maps.clone());
                 Ok(ServedShMemResponse::Id(client_id))
             }
             ServedShMemRequest::PostForkChildHello(other_id) => {
-                let client = self.clients.get_mut(&client_id).unwrap();
-                client.maps = self.forking_clients.remove(&other_id).unwrap();
-                Ok(ServedShMemResponse::Id(client_id))
+                let client = self.clients.get_mut(&client_id)
+                    .ok_or_else(|| Error::illegal_state(format!("Client for fd {} not found", client_id)))?;
+                if let Some(maps) = self.forking_clients.remove(&other_id) {
+                    client.maps = maps;
+                    Ok(ServedShMemResponse::Id(client_id))
+                } else {
+                    Err(Error::illegal_state(format!(
+                        "No forking maps found for other_id {}. Ensure pre_fork() was called and the parent's maps were registered properly.",
+                        other_id
+                    )))
+                }
             }
             ServedShMemRequest::NewMap(map_size) => {
                 let new_shmem = self.provider.new_shmem(map_size)?;

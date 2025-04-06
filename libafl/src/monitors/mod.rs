@@ -197,18 +197,22 @@ where
 
         // Only print perf monitor if the feature is enabled
         #[cfg(feature = "introspection")]
-        {
-            // Print the client performance monitor.
-            let fmt = format!(
-                "Client {:03}:\n{}",
-                sender_id.0,
-                client_stats_manager.client_stats()[sender_id.0 as usize].introspection_stats
-            );
-            (self.print_fn)(&fmt);
-
-            // Separate the spacing just a bit
-            (self.print_fn)("");
-        }
+{
+    let client_stats = client_stats_manager.client_stats();
+    let idx = sender_id.0 as usize;
+    if idx < client_stats.len() {
+        let fmt = format!(
+            "Client {:03}:\n{}",
+            sender_id.0,
+            client_stats[idx].introspection_stats
+        );
+        (self.print_fn)(&fmt);
+    } else {
+        (self.print_fn)(&format!("Client {:03} stats not available", sender_id.0));
+    }
+    // Separate the spacing just a bit
+    (self.print_fn)("");
+}
     }
 }
 

@@ -132,7 +132,7 @@ where
                 if coverage_data.is_empty() {
                    // println!("[DEBUG] 커버리지 데이터 없음");
                 } else {
-                    let old_count = self.hit_offsets.len();
+        ////            let old_count = self.hit_offsets.len();
                     let mut new_hits = Vec::new();
 
                     for &addr in coverage_data.iter() {
@@ -141,16 +141,16 @@ where
                         }
                     }
 
-                    let new_count = self.hit_offsets.len() - old_count;
+     ////               let new_count = self.hit_offsets.len() - old_count;
 
                     if !new_hits.is_empty() {
-                        println!("[DEBUG] 신규 발견된 Offset: {:?}", new_hits);
+          ////              println!("[DEBUG] 신규 발견된 Offset: {:?}", new_hits);
                     }
-                    println!("[DEBUG] 이번 실행에서 추가된 offset 개수: {}", new_count);
-                    println!("[DEBUG] 총 히트된 offset 개수: {}", self.hit_offsets.len());
+           ////         println!("[DEBUG] 이번 실행에서 추가된 offset 개수: {}", new_count);
+           ////         println!("[DEBUG] 총 히트된 offset 개수: {}", self.hit_offsets.len());
                 }
             } else {
-                println!("[DEBUG] coverage_ptr가 NULL입니다.");
+          ////      println!("[DEBUG] coverage_ptr가 NULL입니다.");
             }
         }
 
@@ -159,7 +159,7 @@ where
         let mut final_status = status;
 
         while matches!(final_status, RunResult::CRASH | RunResult::HANG) && retry_count < 3 {
-            println!("[DEBUG] RunResult::{:?} 발생, 재시도 중... ({}/{})", final_status, retry_count + 1, 4);
+   ////         println!("[DEBUG] RunResult::{:?} 발생, 재시도 중... ({}/{})", final_status, retry_count + 1, 4);
             retry_count += 1;
             unsafe {
                 final_status = self.tinyinst.run();
@@ -170,11 +170,11 @@ where
 
         match final_status {
             RunResult::CRASH | RunResult::HANG if retry_count == 3 => {
-                println!("[DEBUG] 4회 모두 CRASH/HANG 발생, Crash로 처리");
+     /////           println!("[DEBUG] 4회 모두 CRASH/HANG 발생, Crash로 처리");
                 Ok(ExitKind::Crash)
             }
             RunResult::CRASH | RunResult::HANG => {
-                println!("[DEBUG] 재시도 도중 상태 변경됨, Crash 아님");
+    /////            println!("[DEBUG] 재시도 도중 상태 변경됨, Crash 아님");
                 Ok(ExitKind::Ok)
             }
             RunResult::OK => Ok(ExitKind::Ok),

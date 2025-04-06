@@ -28,8 +28,11 @@ use libafl_tinyinst::executor::TinyInstExecutor;
 static mut COVERAGE: Vec<u64> = vec![];
 static FUZZING: AtomicBool = AtomicBool::new(true);
 
-#[cfg(any(target_vendor = "apple", windows, target_os = "linux"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // env_logger를 초기화합니다.
+    // env_logger는 기본적으로 로그를 stderr로 출력합니다.
+    env_logger::init();
+
     // 실행 전에 이전에 생성된 서버 소켓 파일("./libafl_unix_shmem_server")이 있다면 삭제할 것!
     #[cfg(target_vendor = "apple")]
     {
@@ -102,7 +105,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // corpus가 비어 있으면 최소한 하나의 시드 입력 파일을 추가해야 합니다.
             if corpus.count() == 0 {
-                return Err(libafl::Error::illegal_state("Corpus is empty. Please add at least one seed file.".to_string()).into());
+                return Err(libafl::Error::illegal_state(
+                    "Corpus is empty. Please add at least one seed file.".to_string(),
+                )
+                .into());
             }
 
             // 크래시 저장 corpus
@@ -130,6 +136,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .tinyinst_args(tinyinst_args.clone())
                 .program_args(args.clone())
                 .timeout(Duration::from_millis(4000))
+                .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 10000) //persistent mode 쓸라면 이거 주석해제
                 .coverage_ptr(unsafe { &mut COVERAGE })
                 .build(tuple_list!(ListObserver::new(
                     "cov",
@@ -145,9 +152,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Ok(())
         })
+
+        
+
         .cores(&cores)
         .broker_port(broker_port)
-       // .stdout_file(Some("/tmp/tinyinst_simple.log"))
+        // stdout_file 옵션을 제거합니다.
+        //.stdout_file(Some("./log"))
         .build()
         .launch::<BytesInput, ()>()?;
 

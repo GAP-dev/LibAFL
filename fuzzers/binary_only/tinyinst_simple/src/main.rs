@@ -5,7 +5,7 @@ use libafl::{
     events::{SimpleEventManager, EventConfig, launcher::Launcher},
     feedbacks::{CrashFeedback, ListFeedback},
     inputs::BytesInput,
-    monitors::SimpleMonitor,
+    monitors::MultiMonitor,
     mutators::{havoc_mutations, StdScheduledMutator},
     observers::ListObserver,
     schedulers::RandScheduler,
@@ -13,7 +13,7 @@ use libafl::{
     state::StdState,
     Fuzzer, StdFuzzer,
 };
-use libafl_bolts::shmem::{ServedShMemProvider, MmapShMemProvider};
+use libafl_bolts::shmem::{ServedShMemProvider, MmapShMemProvider, StdShMemProvider};
 #[cfg(unix)]
 use libafl_bolts::shmem::UnixShMemProvider;
 #[cfg(windows)]
@@ -68,17 +68,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let crashes_path = PathBuf::from("./crashes");
 
     // Monitor 설정 (각 클라이언트에 전달)
-    let monitor = SimpleMonitor::new(|x| println!("{x}"));
-
+   /// let monitor = SimpleMonitor::new(|x| println!("{x}"));
+   let monitor = MultiMonitor::new(|s| println!("{s}"));
     // shmem_provider 초기화  
     // 여기서는 ServedShMemProvider를 MmapShMemProvider 기반으로 사용합니다.
-    let mut shmem_provider = ServedShMemProvider::<MmapShMemProvider>::new()?;
+   
+   
+    let shmem_provider = StdShMemProvider::new().expect("Failed to init shared memory");
+    ///////let mut shmem_provider = ServedShMemProvider::<MmapShMemProvider>::new()?;
     // 만약 POSIX 계열 UnixShMemProvider나 Windows 환경을 사용하려면 아래 주석을 해제하세요.
     // let mut shmem_provider = UnixShMemProvider::new()?;
     // let mut shmem_provider = Win32ShMemProvider::new()?;
 
     // 병렬 처리할 코어와 브로커 포트 지정
-    let forks = 10; // 예시: 10개의 프로세스 사용
+    let forks = 3; // 예시: 10개의 프로세스 사용
     let cores = Cores::from((0..forks).collect::<Vec<_>>());
     let broker_port = 1337; // 사용 가능한 포트 번호
 
@@ -122,7 +125,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let scheduler = RandScheduler::new();
             let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
-            let monitor = SimpleMonitor::new(|x| println!("{x}"));
+            let monitor = MultiMonitor::new(|s| println!("{s}"));
+            ///let monitor = SimpleMonitor::new(|x| println!("{x}"));
             let mut event_manager = SimpleEventManager::new(monitor.clone());
 
             // Executor 초기화
@@ -157,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         .cores(&cores)
         .broker_port(broker_port)
+        
         // stdout_file 옵션을 제거합니다.
         //.stdout_file(Some("./log"))
         .build()

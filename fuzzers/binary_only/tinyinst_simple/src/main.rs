@@ -43,7 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 공통 변수 설정
-    let tinyinst_args = vec!["-instrument_module".to_string(), "ImageIO".to_string()];
+    let tinyinst_args = vec!["-instrument_module".to_string(), "ImageIO".to_string()
+    
+//    ,"-ignore_exceptions".to_string(), // C++ 예외 무시 추가
+    ];
     let args = vec![
         "/Users/gap_dev/fuzz_jack/Jackalope/build/examples/ImageIO/Release/test_imageio".to_string(),
         "-f".to_string(),
@@ -73,7 +76,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // shmem_provider 초기화  
     // 여기서는 ServedShMemProvider를 MmapShMemProvider 기반으로 사용합니다.
    
-   
+
+// 수정 ✅
+//    let mut shmem_provider = ServedShMemProvider::<UnixShMemProvider>::new()?;
+//    shmem_provider.pre_fork()?;
     let shmem_provider = StdShMemProvider::new().expect("Failed to init shared memory");
     ///////let mut shmem_provider = ServedShMemProvider::<MmapShMemProvider>::new()?;
     // 만약 POSIX 계열 UnixShMemProvider나 Windows 환경을 사용하려면 아래 주석을 해제하세요.
@@ -130,22 +136,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut event_manager = SimpleEventManager::new(monitor.clone());
 
             // Executor 초기화
-            let tinyinst_args = vec!["-instrument_module".to_string(), "ImageIO".to_string()];
+            let tinyinst_args = vec!["-instrument_module".to_string(), "ImageIO".to_string()
+//            ,"-ignore_exceptions".to_string(),
+            
+            ];
             let args = vec![
                 "/Users/gap_dev/fuzz_jack/Jackalope/build/examples/ImageIO/Release/test_imageio".to_string(),
                 "-f".to_string(),
                 "@@".to_string(),
             ];
             let mut executor = TinyInstExecutor::builder()
-                .tinyinst_args(tinyinst_args.clone())
-                .program_args(args.clone())
-                .timeout(Duration::from_millis(4000))
-                .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 10000) //persistent mode 쓸라면 이거 주석해제
-                .coverage_ptr(unsafe { &mut COVERAGE })
-                .build(tuple_list!(ListObserver::new(
-                    "cov",
-                    unsafe { OwnedMutPtr::Ptr(&mut COVERAGE as *mut Vec<u64>) }
-                )))?;
+    .tinyinst_args(tinyinst_args.clone())
+    .program_args(args.clone())
+    .timeout(Duration::from_millis(4000))
+    .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 10000)
+    .coverage_ptr(unsafe { &mut COVERAGE })
+    .build(tuple_list!(ListObserver::new(
+        "cov",
+        unsafe { 
+            if COVERAGE.len() == 0 {
+                COVERAGE = vec![0u64; 65536];
+            }
+            OwnedMutPtr::Ptr(&mut COVERAGE as *mut Vec<u64>)
+        }
+    )))?;
 
             let mutator = StdScheduledMutator::new(havoc_mutations());
             let mut stages = tuple_list!(StdMutationalStage::new(mutator));
@@ -153,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 실제 fuzzing 루프 실행
             fuzzer.fuzz_loop(&mut stages, &mut executor, &mut state, &mut event_manager)
                 .expect("error in fuzzing loop");
-
+          ///  println!("[*] COVERAGE snapshot: {:?}", unsafe { &COVERAGE[..16] });
             Ok(())
         })
 

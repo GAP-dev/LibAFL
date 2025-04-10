@@ -183,8 +183,19 @@ where
             )),
             _ => Err(Error::unknown("Tinyinst RunResult is unknown".to_string())),
         }
+        
+    }
+    
+}
+
+
+impl<S, SHM, OT> TinyInstExecutor<S, SHM, OT> {
+    /// 반환: 누적된 hit offset 집합에 대한 참조
+    pub fn hit_offsets(&self) -> &HashSet<u64> {
+        &self.hit_offsets
     }
 }
+
 
 /// Builder for `TinyInstExecutor`
 #[derive(Debug)]

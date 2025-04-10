@@ -132,7 +132,7 @@ where
                 if coverage_data.is_empty() {
                    // println!("[DEBUG] 커버리지 데이터 없음");
                 } else {
-        ////            let old_count = self.hit_offsets.len();
+                    let old_count = self.hit_offsets.len();
                     let mut new_hits = Vec::new();
 
                     for &addr in coverage_data.iter() {
@@ -141,16 +141,16 @@ where
                         }
                     }
 
-     ////               let new_count = self.hit_offsets.len() - old_count;
+                    let new_count = self.hit_offsets.len() - old_count;
 
                     if !new_hits.is_empty() {
-          ////              println!("[DEBUG] 신규 발견된 Offset: {:?}", new_hits);
+                        println!("[DEBUG] 신규 발견된 Offset: {:?}", new_hits);
                     }
-           ////         println!("[DEBUG] 이번 실행에서 추가된 offset 개수: {}", new_count);
-           ////         println!("[DEBUG] 총 히트된 offset 개수: {}", self.hit_offsets.len());
+                    println!("[DEBUG] 이번 실행에서 추가된 offset 개수: {}", new_count);
+                    println!("[DEBUG] 총 히트된 offset 개수: {}", self.hit_offsets.len());
                 }
             } else {
-          ////      println!("[DEBUG] coverage_ptr가 NULL입니다.");
+                println!("[DEBUG] coverage_ptr가 NULL입니다.");
             }
         }
 
@@ -185,6 +185,16 @@ where
         }
     }
 }
+
+
+
+impl<S, SHM, OT> TinyInstExecutor<S, SHM, OT> {
+    /// 반환: 누적된 hit offset 집합에 대한 참조
+    pub fn hit_offsets(&self) -> &HashSet<u64> {
+        &self.hit_offsets
+    }
+}
+
 
 /// Builder for `TinyInstExecutor`
 #[derive(Debug)]

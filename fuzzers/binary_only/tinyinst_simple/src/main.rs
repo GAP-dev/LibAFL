@@ -62,6 +62,9 @@ struct Config {
     #[clap(long, default_value = "100")]
     iterations: usize,
 
+    #[clap(long, default_value = "5")]
+    loop_iterations: usize,
+
     /// 각 반복 내 fuzzing 루프 횟수
     #[clap(long, default_value = "100")]
     fuzz_iterations: usize,
@@ -265,7 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // --- Fuzzing 루프 실행 ---
                 for _ in 0..config.fuzz_iterations {
                     fuzzer
-                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager, 100)
+                    .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager, config.loop_iterations as u64)
                         .expect("error in fuzzing loop");
 
                     // 각 fuzzing 호출 후 현재 커버리지 데이터를 출력

@@ -4,7 +4,7 @@ use std::{
     sync::atomic::AtomicBool,
     time::Duration,
 };
-
+use libafl::state::HasCorpus;
 use libafl::{
     corpus::{CachedOnDiskCorpus, Corpus, OnDiskCorpus, Testcase},
     events::{launcher::Launcher, EventConfig, SimpleEventManager},
@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shmem_provider = StdShMemProvider::new().expect("Failed to init shared memory");
 
     // 사용할 코어 설정 (예: 3개)
-    let forks = 10;
+    let forks = 3;
     let cores = Cores::from((0..forks).collect::<Vec<_>>());
     let broker_port = 1337;
 
@@ -198,14 +198,95 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // --- Fuzzing 루프 실행 ---
                 fuzzer
-                    .fuzz_loop(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
                     .expect("error in fuzzing loop");
 
                 // iteration 종료 후 현재 커버리지 데이터를 출력
                 println!(
-                    "Iteration {} - Coverage data: {:?}",
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
                     i + 1,
-                    executor.hit_offsets()
+                    executor.hit_offsets().len(),
+                    state.corpus().count()
+                );
+
+
+
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .expect("error in fuzzing loop");
+
+                // iteration 종료 후 현재 커버리지 데이터를 출력
+                println!(
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                    i + 1,
+                    executor.hit_offsets(),
+                    state.corpus().count()
+                );
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .expect("error in fuzzing loop");
+
+                // iteration 종료 후 현재 커버리지 데이터를 출력
+                println!(
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                    i + 1,
+                    executor.hit_offsets(),
+                    state.corpus().count()
+                );
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .expect("error in fuzzing loop");
+
+                // iteration 종료 후 현재 커버리지 데이터를 출력
+                println!(
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                    i + 1,
+                    executor.hit_offsets(),
+                    state.corpus().count()
+                );
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .expect("error in fuzzing loop");
+
+                // iteration 종료 후 현재 커버리지 데이터를 출력
+                println!(
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                    i + 1,
+                    executor.hit_offsets(),
+                    state.corpus().count()
+                );
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .expect("error in fuzzing loop");
+
+                // iteration 종료 후 현재 커버리지 데이터를 출력
+                println!(
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                    i + 1,
+                    executor.hit_offsets(),
+                    state.corpus().count()
+                );
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .expect("error in fuzzing loop");
+
+                // iteration 종료 후 현재 커버리지 데이터를 출력
+                println!(
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                    i + 1,
+                    executor.hit_offsets(),
+                    state.corpus().count()
+                );
+                fuzzer
+                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
+                    .expect("error in fuzzing loop");
+
+                // iteration 종료 후 현재 커버리지 데이터를 출력
+                println!(
+                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                    i + 1,
+                    executor.hit_offsets(),
+                    state.corpus().count()
                 );
             }
             Ok(())

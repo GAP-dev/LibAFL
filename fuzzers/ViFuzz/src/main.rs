@@ -1,7 +1,6 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::atomic::AtomicBool,
     thread,
     time::Duration,
 };
@@ -9,15 +8,19 @@ use std::{
 use clap::Parser;
 use libafl::state::HasCorpus;
 use libafl::{
+    feedback_or, feedback_or_fast,
     corpus::{CachedOnDiskCorpus, Corpus, OnDiskCorpus, Testcase},
     events::{launcher::Launcher, EventConfig, SimpleEventManager},
-    feedbacks::{CrashFeedback, ListFeedback},
+    feedbacks::{CrashFeedback, ListFeedback, MapFeedback, MaxMapFeedback, TimeFeedback},
     inputs::BytesInput,
     monitors::MultiMonitor,
-    mutators::{havoc_mutations, StdScheduledMutator},
-    observers::ListObserver,
-    schedulers::RandScheduler,
-    stages::{StdMutationalStage},
+    mutators::{havoc_mutations, StdMOptMutator},
+    // MapObserver와 TimeObserver 사용
+    observers::{StdMapObserver, TimeObserver},
+    // 기본 큐 스케줄러 사용
+    schedulers::QueueScheduler,
+    // 기본 mutational stage (MOpt 독립 사용)
+    stages::mutational::StdMutationalStage,
     state::{StdState, HasSolutions},
     Fuzzer, StdFuzzer,
 };
@@ -27,13 +30,10 @@ use libafl_bolts::{
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::tuple_list,
-    ownedref::OwnedMutPtr,
 };
 
 use libafl_tinyinst::executor::TinyInstExecutor;
-
-// 추가: 랜덤 딜레이를 위해 rand 사용
-use rand::Rng;
+use rand::Rng; // Rng 트레이트를 가져옵니다.
 
 // coverage 맵 크기 (원소 개수)
 const MAP_SIZE: usize = 65536;
@@ -46,66 +46,51 @@ static mut COVERAGE: Vec<u64> = Vec::new();
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Config {
-    /// Corpus 디렉토리 경로 (seed 파일들이 위치)
     #[clap(long, value_parser, default_value = "../../corpus_discovered")]
     corpus_path: PathBuf,
 
-    /// Crashes 디렉토리 경로 (크래시 케이스 저장용)
     #[clap(long, value_parser, default_value = "./crashes")]
     crashes_path: PathBuf,
 
-    /// Broker 포트 번호
     #[clap(long, default_value = "1337")]
     broker_port: u16,
 
-    /// 사용할 코어(포크) 수
     #[clap(long, default_value = "1")]
     forks: usize,
 
-    /// 클라이언트 반복 횟수 (전체 fuzzing iteration 수)
     #[clap(long, default_value = "100")]
     iterations: usize,
+
+    #[clap(long, default_value = "100")]
+    fuzz_iterations: usize,
 
     #[clap(long, default_value = "5")]
     loop_iterations: usize,
 
-    /// 각 반복 내 fuzzing 루프 횟수
-    #[clap(long, default_value = "100")]
-    fuzz_iterations: usize,
-
-    /// 타임아웃 (밀리초 단위)
     #[clap(long, default_value = "4000")]
     timeout: u64,
 
-    /// TinyInst용 instrument 모듈 이름
     #[clap(long, default_value = "ImageIO")]
     tinyinst_module: String,
 
-    /// 추가 TinyInst 인자 (옵션)
     #[clap(long)]
     tinyinst_extra: Option<String>,
 
-    /// 타깃 실행 파일 경로 (반드시 지정)
     #[clap(long, value_parser)]
     target: PathBuf,
 
-    /// 타깃 인자 (target 실행 시 전달할 추가 인자들)
     #[clap(last = true)]
     target_args: Vec<String>,
 
-    /// persistent 모드: 타깃 모듈 이름 (옵션; 지정되면 persistent 모드 활성)
     #[clap(long)]
     persistent_target: Option<String>,
 
-    /// persistent 모드: 추가 접두어 (옵션; persistent_target와 모두 지정되어야 함)
     #[clap(long)]
     persistent_prefix: Option<String>,
 
-    /// persistent 모드: 반복 횟수 (default 1)
     #[clap(long, default_value_t = 1)]
     persistent_iterations: usize,
 
-    /// persistent 모드: 타임아웃 (default 10000)
     #[clap(long, default_value_t = 10000)]
     persistent_timeout: usize,
 }
@@ -118,17 +103,11 @@ fn ensure_dir_exists(dir: &PathBuf) -> std::io::Result<()> {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // CLI 인자 파싱
     let config = Config::parse();
-    
-    // corpus와 crashes 디렉토리 존재 확인 (없으면 생성)
     ensure_dir_exists(&config.corpus_path)?;
     ensure_dir_exists(&config.crashes_path)?;
-
-    // env_logger 초기화 (로그 출력은 stderr)
     env_logger::init();
 
-    // macOS 환경: TinyInst용 이전 유닉스 소켓 파일 제거 (필요시)
     #[cfg(target_vendor = "apple")]
     {
         let socket_path = "./libafl_unix_shmem_server";
@@ -137,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // TinyInst에 전달할 인자 구성
+    // TinyInst 인자 구성
     let mut tinyinst_args = vec![
         "-instrument_module".to_string(),
         config.tinyinst_module.clone(),
@@ -147,60 +126,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tinyinst_args.push(extra.clone());
     }
 
-    // 대상 프로그램 인자 구성: 첫번째 인자는 타깃 실행 파일 경로, 그 뒤에 추가 인자들을 전달
+    // 타깃 실행 인자 구성
     let mut target_args = vec![config.target.to_string_lossy().into()];
     target_args.extend(config.target_args.iter().cloned());
 
-    // corpus 및 crashes 디렉토리 경로 복사
     let corpus_path = config.corpus_path.clone();
     let crashes_path = config.crashes_path.clone();
 
-    // 기존 코드에서는 corpus 디렉토리 내 숨김 파일을 삭제했지만, 
-    // 이제는 숨김 파일은 삭제하지 않고, 이후 로딩 시 무시합니다.
-    // remove_hidden_files(&corpus_path)?;
-
-    // 전역 COVERAGE 벡터를 MAP_SIZE만큼 0으로 초기화
+    // COVERAGE 초기화
     unsafe {
         COVERAGE.resize(MAP_SIZE, 0);
     }
 
-    // 병렬 실행을 위한 모니터 설정 (출력은 stdout)
     let monitor = MultiMonitor::new(|s| println!("{s}"));
-
-    // 공용 Shared Memory Provider 초기화
     let shmem_provider = StdShMemProvider::new().expect("Failed to init shared memory");
-
-    // 사용할 코어 설정 (config.forks 개)
     let cores = Cores::from((0..config.forks).collect::<Vec<_>>());
     let broker_port = config.broker_port;
 
-    // Launcher를 통해 병렬 클라이언트 실행
     Launcher::builder()
         .shmem_provider(shmem_provider)
         .configuration(EventConfig::from_name("MyFuzzer"))
         .monitor(monitor.clone())
         .run_client(|_state, _mgr, _client| {
-            // 각 클라이언트가 시작될 때 500ms ~ 2000ms 사이의 랜덤 딜레이 (현재는 0~100ms)
-            let delay_ms = rand::thread_rng().gen_range(0..100);
-            println!("Waiting for {} ms before client initialization...", delay_ms);
-            thread::sleep(Duration::from_millis(delay_ms));
-
             let iterations = config.iterations;
             let base_rand = StdRand::new();
 
             for i in 0..iterations {
                 println!("==> Starting fuzzing iteration {} in client", i + 1);
 
-                // corpus 재로드 시, 숨김 파일은 무시합니다.
+                // corpus 재로드
                 let mut corpus = CachedOnDiskCorpus::new(corpus_path.clone(), 64)?;
                 if let Ok(entries) = fs::read_dir(&corpus_path) {
                     for entry in entries.flatten() {
-                        // 파일명이 '.'으로 시작하는 경우 무시
-                        if let Some(filename) = entry
-                            .path()
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                        {
+                        if let Some(filename) = entry.path().file_name().and_then(|n| n.to_str()) {
                             if filename.starts_with('.') {
                                 continue;
                             }
@@ -218,19 +176,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
 
-                // Crash 케이스 저장용 corpus 생성
                 let solutions = OnDiskCorpus::new(crashes_path.clone())?;
 
-                // --- Observer 생성 ---
-                // ListObserver를 전역 COVERAGE에 대한 포인터로 생성합니다.
-                let coverage_ptr = OwnedMutPtr::Ptr(unsafe { &mut COVERAGE });
-                let list_observer = ListObserver::new("cov", coverage_ptr);
+                // MapObserver 생성: 내부 슬라이스(&mut [u64]) 제공
+                let map_observer = unsafe { StdMapObserver::new("cov", &mut COVERAGE[..]) };
+                let time_observer = TimeObserver::new("exec_time");
 
-                // --- Feedback 생성 ---
-                let mut feedback = ListFeedback::new(&list_observer);
+                // MOpt mutator를 포함하는 피드백 구조 구성
+                let map_feedback = MaxMapFeedback::new(&map_observer);
+                let mut feedback = feedback_or!(map_feedback, TimeFeedback::new(&time_observer));
                 let mut objective = CrashFeedback::new();
 
-                // --- State 생성 ---
+                // State 생성
                 let mut state = StdState::new(
                     base_rand.clone(),
                     corpus,
@@ -239,38 +196,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &mut objective,
                 )?;
 
-                // Fuzzer 및 스케줄러 생성
-                let scheduler = RandScheduler::new();
+                // 기본 큐 스케줄러 사용
+                let scheduler = QueueScheduler::new();
                 let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-                // 이벤트 매니저 생성
                 let mut event_manager = SimpleEventManager::new(monitor.clone());
 
-                // --- Executor 생성 ---
+                // TinyInstExecutor 빌드
                 let builder = TinyInstExecutor::builder()
                     .tinyinst_args(tinyinst_args.clone())
                     .program_args(target_args.clone())
                     .timeout(Duration::from_millis(config.timeout));
 
-                let builder = if let (Some(p_target), Some(p_prefix)) = (
-                    config.persistent_target.clone(),
-                    config.persistent_prefix.clone(),
-                ) {
+                let builder = if let (Some(p_target), Some(p_prefix)) =
+                    (config.persistent_target.clone(), config.persistent_prefix.clone())
+                {
                     builder.persistent(p_target, p_prefix, config.persistent_iterations, config.persistent_timeout)
                 } else {
                     builder
                 };
 
-                // executor에 ListObserver를 사용하여 빌드합니다.
                 let mut executor = builder
                     .coverage_ptr(unsafe { &mut COVERAGE as *mut Vec<u64> })
-                    .build(tuple_list!(list_observer))?;
+                    .build(tuple_list!(map_observer, time_observer))?;
 
-                // --- Mutator 및 Stage 생성 ---
-                let mutator = StdScheduledMutator::new(havoc_mutations());
-                let mut stages = tuple_list!(StdMutationalStage::new(mutator));
+                // MOpt mutator를 독립적으로 사용하기 위해 기본 mutational stage로 감싸기
+                let mopt_mutator = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5)?;
+                let mopt_stage = StdMutationalStage::new(mopt_mutator);
+                let mut stages = tuple_list!(mopt_stage);
 
-                // --- Fuzzing 루프 실행 ---
+                // fuzzing 루프 실행
                 for k in 0..config.fuzz_iterations {
                     fuzzer.fuzz_loop_for(
                         &mut stages,
@@ -286,10 +241,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         k + 1,
                         executor.hit_offsets().len(),
                         state.corpus().count(),
-                        state.solutions().count()  // 크래시 케이스 수 출력
+                        state.solutions().count()
                     );
 
-                    // 추가 seed 파일들 처리 (숨김 파일은 무시)
+                    // 새로운 seed 파일들 추가
                     if let Ok(entries) = fs::read_dir(&corpus_path) {
                         for entry in entries.flatten() {
                             if let Some(filename) = entry.path().file_name().and_then(|n| n.to_str()) {
@@ -329,7 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .cores(&cores)
         .broker_port(broker_port)
-        .build() // build()는 Result가 아닌 Launcher를 반환합니다.
+        .build()
         .launch::<BytesInput, ()>()?;
 
     Ok(())

@@ -85,3 +85,8 @@ rustc-ice-*
 
 # backup files
 *.bak
+
+
+!restart.sh
+!exec.py
+!fuzzers/ViFuzz/

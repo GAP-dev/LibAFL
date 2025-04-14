@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+
   "libafl",
   "libafl_bolts",
   "libafl_cc",
@@ -56,6 +57,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 # Internal deps
+ViFuzz = { path = "./ViFuzz", version = "1.0.0", default-features = false }
 libafl = { path = "./libafl", version = "0.15.1", default-features = false }
 libafl_bolts = { path = "./libafl_bolts", version = "0.15.1", default-features = false }
 libafl_cc = { path = "./libafl_cc", version = "0.15.1", default-features = false }

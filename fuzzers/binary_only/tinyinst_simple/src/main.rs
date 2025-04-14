@@ -11,11 +11,11 @@ use libafl::state::HasCorpus;
 use libafl::{
     corpus::{CachedOnDiskCorpus, Corpus, OnDiskCorpus, Testcase},
     events::{launcher::Launcher, EventConfig, SimpleEventManager},
-    feedbacks::{CrashFeedback, map::MaxMapFeedback},
+    feedbacks::{CrashFeedback, ListFeedback},
     inputs::BytesInput,
     monitors::MultiMonitor,
     mutators::{havoc_mutations, StdScheduledMutator},
-    observers::{StdMapObserver, HitcountsMapObserver},
+    observers::ListObserver,
     schedulers::RandScheduler,
     stages::StdMutationalStage,
     state::StdState,
@@ -27,6 +27,7 @@ use libafl_bolts::{
     rands::StdRand,
     shmem::{ShMemProvider, StdShMemProvider},
     tuples::tuple_list,
+    ownedref::OwnedMutPtr,
 };
 
 use libafl_tinyinst::executor::TinyInstExecutor;
@@ -39,7 +40,6 @@ const MAP_SIZE: usize = 65536;
 
 // 전역 COVERAGE: TinyInst가 기록할 hit-count 정보를 저장  
 // TinyInstExecutor는 *mut Vec<u64>를 요구합니다.
-static FUZZING: AtomicBool = AtomicBool::new(true);
 static mut COVERAGE: Vec<u64> = Vec::new();
 
 /// Fuzzer 설정 (CLI 인자)
@@ -124,9 +124,20 @@ fn remove_hidden_files(dir: &PathBuf) -> std::io::Result<()> {
     Ok(())
 }
 
+fn ensure_dir_exists(dir: &PathBuf) -> std::io::Result<()> {
+    if !dir.exists() {
+        fs::create_dir_all(dir)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // CLI 인자 파싱
     let config = Config::parse();
+    
+    // corpus와 crashes 디렉토리 존재 확인 (없으면 생성)
+    ensure_dir_exists(&config.corpus_path)?;
+    ensure_dir_exists(&config.crashes_path)?;
 
     // env_logger 초기화 (로그 출력은 stderr)
     env_logger::init();
@@ -154,7 +165,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut target_args = vec![config.target.to_string_lossy().into()];
     target_args.extend(config.target_args.iter().cloned());
 
-    // corpus 및 crashes 디렉토리 경로
+    // corpus 및 crashes 디렉토리 경로 복사
     let corpus_path = config.corpus_path.clone();
     let crashes_path = config.crashes_path.clone();
 
@@ -193,10 +204,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for i in 0..iterations {
                 println!("==> Starting fuzzing iteration {} in client", i + 1);
 
-                // 각 iteration 시작 시 corpus 내 숨김 파일 제거
+                // corpus 내 숨김 파일 제거 및 corpus 재로드
                 remove_hidden_files(&corpus_path)?;
-
-                // 디스크에 저장된 corpus 재로드
                 let mut corpus = CachedOnDiskCorpus::new(corpus_path.clone(), 64)?;
                 if let Ok(entries) = fs::read_dir(&corpus_path) {
                     for entry in entries.flatten() {
@@ -213,21 +222,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .into());
                 }
 
-                // 크래시 케이스 저장용 corpus 생성
+                // Crash 케이스 저장용 corpus 생성
                 let solutions = OnDiskCorpus::new(crashes_path.clone())?;
 
                 // --- Observer 생성 ---
-                let coverage_slice: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        COVERAGE.as_mut_ptr() as *mut u8,
-                        COVERAGE.len() * std::mem::size_of::<u64>(),
-                    )
-                };
-                let std_map_observer = unsafe { StdMapObserver::new("coverage_map", coverage_slice) };
-                let map_observer = HitcountsMapObserver::new(std_map_observer);
+                // ListObserver를 전역 COVERAGE에 대한 포인터로 생성합니다.
+                let coverage_ptr = OwnedMutPtr::Ptr(unsafe { &mut COVERAGE });
+                let list_observer = ListObserver::new("cov", coverage_ptr);
 
                 // --- Feedback 생성 ---
-                let mut feedback = MaxMapFeedback::with_name("max_map_feedback", &map_observer);
+                let mut feedback = ListFeedback::new(&list_observer);
                 let mut objective = CrashFeedback::new();
 
                 // --- State 생성 ---
@@ -261,9 +265,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     builder
                 };
 
+                // executor에 ListObserver를 사용하여 빌드합니다.
                 let mut executor = builder
                     .coverage_ptr(unsafe { &mut COVERAGE as *mut Vec<u64> })
-                    .build(tuple_list!(map_observer))?;
+                    .build(tuple_list!(list_observer))?;
 
                 // --- Mutator 및 Stage 생성 ---
                 let mutator = StdScheduledMutator::new(havoc_mutations());
@@ -271,10 +276,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // --- Fuzzing 루프 실행 ---
                 for _ in 0..config.fuzz_iterations {
-                    fuzzer
-                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager, config.loop_iterations as u64)
-                        .expect("error in fuzzing loop");
-
+                    fuzzer.fuzz_loop_for(
+                        &mut stages,
+                        &mut executor,
+                        &mut state,
+                        &mut event_manager,
+                        config.loop_iterations as u64,
+                    )?;
                     println!(
                         "Pid: {}, Tid: {:?} | Iteration {} - Coverage count: {} | Corpus entries: {}",
                         std::process::id(),
@@ -300,7 +308,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
                             };
-
                             let already_present = state.corpus().ids().any(|id| {
                                 if let Ok(testcase_cell) = state.corpus().get(id) {
                                     let testcase = testcase_cell.borrow();
@@ -313,7 +320,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     false
                                 }
                             });
-
                             if already_present {
                                 continue;
                             }
@@ -322,7 +328,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                // 필요시 각 iteration 후 corpus를 디스크에 저장하거나 추가 처리를 할 수 있습니다.
             }
             Ok(())
         })

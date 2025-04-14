@@ -2,6 +2,7 @@ use std::{
     fs,
     path::PathBuf,
     sync::atomic::AtomicBool,
+    thread,
     time::Duration,
 };
 
@@ -29,6 +30,9 @@ use libafl_bolts::{
 };
 
 use libafl_tinyinst::executor::TinyInstExecutor;
+
+// 추가: 랜덤 딜레이를 위해 rand 사용
+use rand::Rng;
 
 // coverage 맵 크기 (원소 개수)
 const MAP_SIZE: usize = 65536;
@@ -178,6 +182,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .configuration(EventConfig::from_name("MyFuzzer"))
         .monitor(monitor.clone())
         .run_client(|_state, _mgr, _client| {
+            // 각 클라이언트가 시작될 때 500ms ~ 2000ms 사이의 랜덤 딜레이를 둡니다.
+            let delay_ms = rand::thread_rng().gen_range(0..4000);
+            println!("Waiting for {} ms before client initialization...", delay_ms);
+            thread::sleep(Duration::from_millis(delay_ms));
+
             let iterations = config.iterations;
             let base_rand = StdRand::new();
 
@@ -208,9 +217,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let solutions = OnDiskCorpus::new(crashes_path.clone())?;
 
                 // --- Observer 생성 ---
-                // TinyInstExecutor는 COVERAGE가 Vec<u64>여야 하지만,
-                // feedback/observer는 기본적으로 u8 슬라이스를 기대하므로,
-                // COVERAGE의 메모리를 바이트 슬라이스로 재해석합니다.
                 let coverage_slice: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(
                         COVERAGE.as_mut_ptr() as *mut u8,
@@ -241,13 +247,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut event_manager = SimpleEventManager::new(monitor.clone());
 
                 // --- Executor 생성 ---
-                // TinyInstExecutor의 builder 체인에서 persistent 옵션을 CLI 인자에 따라 선택적으로 호출합니다.
                 let builder = TinyInstExecutor::builder()
                     .tinyinst_args(tinyinst_args.clone())
                     .program_args(target_args.clone())
                     .timeout(Duration::from_millis(config.timeout));
 
-                // 두 persistent 옵션이 모두 지정된 경우에만 persistent() 호출
                 let builder = if let (Some(p_target), Some(p_prefix)) = (
                     config.persistent_target.clone(),
                     config.persistent_prefix.clone(),
@@ -268,10 +272,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // --- Fuzzing 루프 실행 ---
                 for _ in 0..config.fuzz_iterations {
                     fuzzer
-                    .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager, config.loop_iterations as u64)
+                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager, config.loop_iterations as u64)
                         .expect("error in fuzzing loop");
 
-                    // 각 fuzzing 호출 후 현재 커버리지 데이터를 출력
                     println!(
                         "Pid: {}, Tid: {:?} | Iteration {} - Coverage count: {} | Corpus entries: {}",
                         std::process::id(),
@@ -281,7 +284,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.corpus().count()
                     );
 
-                    // corpus 디렉토리 내 추가 seed 파일들을 확인하고 corpus에 반영
+                    // 추가 seed 파일들 처리
                     if let Ok(entries) = fs::read_dir(&corpus_path) {
                         for entry in entries.flatten() {
                             let path = entry.path();

@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tinyinst_args = vec![
         "-instrument_module".to_string(),
         "ImageIO".to_string(),
+        "-generate_unwind".to_string(),
         // 필요시: "-ignore_exceptions".to_string(),
     ];
 
@@ -197,97 +198,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut stages = tuple_list!(StdMutationalStage::new(mutator));
 
                 // --- Fuzzing 루프 실행 ---
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
+                for _ in 0..100 {
+                    fuzzer
+                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager,10)
+                        .expect("error in fuzzing loop");
+                
+                    // 각 fuzz_one 호출 후 현재 커버리지 데이터를 출력
+                    println!(
+                        "Pid: {}, Tid: {:?} | Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
+                        std::process::id(),
+                        std::thread::current().id(),
+                        i + 1,
+                        executor.hit_offsets().len(),
+                        state.corpus().count()
+                    );
+                
+                    // 테스팅: corpus 디렉토리에서 seed 파일을 추가하는 부분을 별도로 실행
+                    if let Ok(entries) = fs::read_dir(&corpus_path) {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            // 파일명이 '.'으로 시작하면 무시합니다.
+                            if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                                if filename.starts_with('.') {
+                                    continue;
+                                }
+                            }
+                            // 파일의 데이터를 읽습니다.
+                            let data = match fs::read(&path) {
+                                Ok(d) => d,
+                                Err(err) => {
+                                    eprintln!("Failed to read file {:?}: {}", path, err);
+                                    continue;
+                                }
+                            };
+                    
+                            // corpus 내 이미 같은 입력 데이터가 존재하는지 검사합니다.
+                            let already_present = state
+                                .corpus()
+                                .ids()
+                                .any(|id| {
+                                    // 각 테스트 케이스에 대해 input을 가져와서 비교합니다.
+                                    if let Ok(testcase_cell) = state.corpus().get(id) {
+                                        let testcase = testcase_cell.borrow();
+                                        // testcase.input()는 Option<&I>를 반환합니다.
+                                        if let Some(input) = testcase.input() {
+                                            // BytesInput은 내부적으로 Vec<u8>를 보유한다고 가정합니다.
+                                            // 입력 데이터를 바이트 슬라이스로 비교합니다.
+                                            input.as_ref() == data.as_slice()
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                });
+                    
+                            if already_present {
+                                continue;
+                            }
+                    
+                            // 새로운 테스트 케이스를 corpus에 추가합니다.
+                            let input = BytesInput::new(data);
+                            state.corpus_mut().add(Testcase::new(input))?;
+                        }
+                    }
+                }
+                        
+                        // 각 iteration 후 corpus를 디스크에 저장
+                  //      state
+                  //          .corpus()
+                  //          .save_on_disk(&corpus_path)
+                  //          .expect("Failed to save corpus");
+                        // 각 iteration 후 corpus를 디스크에서 로드
 
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets().len(),
-                    state.corpus().count()
-                );
+                        
 
 
-
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
-
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets(),
-                    state.corpus().count()
-                );
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
-
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets(),
-                    state.corpus().count()
-                );
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
-
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets(),
-                    state.corpus().count()
-                );
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
-
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets(),
-                    state.corpus().count()
-                );
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
-
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets(),
-                    state.corpus().count()
-                );
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
-
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets(),
-                    state.corpus().count()
-                );
-                fuzzer
-                    .fuzz_one(&mut stages, &mut executor, &mut state, &mut event_manager)
-                    .expect("error in fuzzing loop");
-
-                // iteration 종료 후 현재 커버리지 데이터를 출력
-                println!(
-                    "Iteration {} - Coverage data: {:?} | Imported {} inputs from disk.",
-                    i + 1,
-                    executor.hit_offsets(),
-                    state.corpus().count()
-                );
+                
             }
             Ok(())
         })

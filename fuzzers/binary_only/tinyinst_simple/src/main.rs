@@ -92,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shmem_provider = StdShMemProvider::new().expect("Failed to init shared memory");
 
     // 사용할 코어 설정 (예: 3개)
-    let forks = 3;
+    let forks = 1;
     let cores = Cores::from((0..forks).collect::<Vec<_>>());
     let broker_port = 1337;
 
@@ -103,7 +103,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .monitor(monitor.clone())
         .run_client(|_state, _mgr, _client| {
             // 각 클라이언트는 여러 iteration 동안 corpus를 재로드
-            let iterations = 3;
+            let iterations = 100;
             let base_rand = StdRand::new();
 
             for i in 0..iterations {
@@ -200,7 +200,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // --- Fuzzing 루프 실행 ---
                 for _ in 0..100 {
                     fuzzer
-                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager,10)
+                        .fuzz_loop_for(&mut stages, &mut executor, &mut state, &mut event_manager,100)
                         .expect("error in fuzzing loop");
                 
                     // 각 fuzz_one 호출 후 현재 커버리지 데이터를 출력

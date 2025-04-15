@@ -15,13 +15,15 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
         "--crashes-path", "./crashes",
         "--broker-port", "8888",
         "--forks", "7",
-        "--iterations", "1000000000000",
-        "--fuzz-iterations", "10000000000000",
-        "--loop-iterations", "10000000000000",
+        "--iterations", "900000000000000",
+        "--fuzz-iterations", "900000000000000",
+        "--loop-iterations", "9000000000000000",
         "--timeout", "4000",
         "--tinyinst-module", "ImageIO",
         "--persistent-target", "test_imageio",
-        "--persistent-prefix", "_fuzz"
+        "--persistent-prefix", "_fuzz",
+        "--persistent-iterations","1",
+        "--persistent-timeout","1000000"
         # 필요시 추가 인자 또는 persistent 옵션을 여기서 추가할 수 있습니다.
     ]
     

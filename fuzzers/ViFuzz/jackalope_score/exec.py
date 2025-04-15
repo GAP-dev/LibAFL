@@ -18,11 +18,13 @@ def run_jackalope_fuzzer(show_raw_output=False, run_duration=600):
         "-target_module", "test_imageio",
         "-target_method", "_fuzz",
         "-nargs", "1",
-        "-iterations", "10000",
+        "-iterations", "1000000",
         "-persist",
         "-loop",
-        "-nthreads", "7",
-        "-nargs", "1"
+        "-nthreads", "1",
+        "-nargs", "1",
+        "-generate_unwind"
+
     ]
     
     # fuzzer 명령어에 필요한 입력 자리표시자(@@) 추가 후 타깃 실행 파일 지정
@@ -143,4 +145,4 @@ def run_jackalope_fuzzer(show_raw_output=False, run_duration=600):
 
 if __name__ == "__main__":
     # show_raw_output를 True로 하면 원본 로그를 타임스탬프와 함께 출력합니다.
-    run_jackalope_fuzzer(show_raw_output=False)
+    run_jackalope_fuzzer(show_raw_output=True)

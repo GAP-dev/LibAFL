@@ -227,12 +227,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // fuzzing 루프 실행
                 for k in 0..config.fuzz_iterations {
-                    fuzzer.fuzz_loop_for(
+                    fuzzer.fuzz_one(
                         &mut stages,
                         &mut executor,
                         &mut state,
                         &mut event_manager,
-                        config.loop_iterations as u64,
                     )?;
                     println!(
                         "Pid: {}, Tid: {:?} | Iteration {} - Coverage count: {} | Corpus entries: {} | Crashes: {}",
@@ -243,41 +242,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         state.corpus().count(),
                         state.solutions().count()
                     );
-
-                    // 새로운 seed 파일들 추가
-                    if let Ok(entries) = fs::read_dir(&corpus_path) {
-                        for entry in entries.flatten() {
-                            if let Some(filename) = entry.path().file_name().and_then(|n| n.to_str()) {
-                                if filename.starts_with('.') {
-                                    continue;
+                    /*if k % 100000 == 0 {
+                        // 새로운 seed 파일들 추가
+                        if let Ok(entries) = fs::read_dir(&corpus_path) {
+                            for entry in entries.flatten() {
+                                if let Some(filename) = entry.path().file_name().and_then(|n| n.to_str()) {
+                                    if filename.starts_with('.') {
+                                        continue;
+                                    }
                                 }
-                            }
-                            let data = match fs::read(&entry.path()) {
-                                Ok(d) => d,
-                                Err(err) => {
-                                    eprintln!("Failed to read file {:?}: {}", entry.path(), err);
-                                    continue;
-                                }
-                            };
-                            let already_present = state.corpus().ids().any(|id| {
-                                if let Ok(testcase_cell) = state.corpus().get(id) {
-                                    let testcase = testcase_cell.borrow();
-                                    if let Some(input) = testcase.input() {
-                                        input.as_ref() == data.as_slice()
+                                let data = match fs::read(&entry.path()) {
+                                    Ok(d) => d,
+                                    Err(err) => {
+                                        eprintln!("Failed to read file {:?}: {}", entry.path(), err);
+                                        continue;
+                                    }
+                                };
+                                let already_present = state.corpus().ids().any(|id| {
+                                    if let Ok(testcase_cell) = state.corpus().get(id) {
+                                        let testcase = testcase_cell.borrow();
+                                        if let Some(input) = testcase.input() {
+                                            input.as_ref() == data.as_slice()
+                                        } else {
+                                            false
+                                        }
                                     } else {
                                         false
                                     }
-                                } else {
-                                    false
+                                });
+                                if already_present {
+                                    continue;
                                 }
-                            });
-                            if already_present {
-                                continue;
+                                let input = BytesInput::new(data);
+                                state.corpus_mut().add(Testcase::new(input))?;
                             }
-                            let input = BytesInput::new(data);
-                            state.corpus_mut().add(Testcase::new(input))?;
                         }
-                    }
+                    }*/
                 }
             }
             Ok(())

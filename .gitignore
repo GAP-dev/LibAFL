@@ -86,7 +86,15 @@ rustc-ice-*
 # backup files
 *.bak
 
-
+test
+corpus_discovered
+crashes
 !restart.sh
 !exec.py
 !fuzzers/ViFuzz/
+fuzzers/ViFuzz/vifuzz_score/test/*
+fuzzers/ViFuzz/vifuzz_score/corpus_discovered/*
+fuzzers/ViFuzz/vifuzz_score/crashes/*
+fuzzers/ViFuzz/jackalope_score/test/*
+fuzzers/ViFuzz/jackalope_score/corpus_discovered/*
+fuzzers/ViFuzz/jackalope_score/crashes/*

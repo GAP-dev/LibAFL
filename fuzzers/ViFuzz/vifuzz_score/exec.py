@@ -15,9 +15,9 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
         "--crashes-path", "./crashes",
         "--broker-port", "8888",
         "--forks", "7",
-        "--iterations", "1",
-        "--fuzz-iterations", "10000",
-        "--loop-iterations", "100",
+        "--iterations", "1000000000000",
+        "--fuzz-iterations", "10000000000000",
+        "--loop-iterations", "10000000000000",
         "--timeout", "4000",
         "--tinyinst-module", "ImageIO",
         "--persistent-target", "test_imageio",
@@ -112,4 +112,4 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
 if __name__ == "__main__":
     # show_raw_output 매개변수를 False로 설정하면 파싱된 결과만 보입니다.
     # stdout 원본 로그도 보고 싶을 경우 True로 변경하면 됩니다.
-    run_rust_fuzzer(show_raw_output=False)
+    run_rust_fuzzer(show_raw_output=True)

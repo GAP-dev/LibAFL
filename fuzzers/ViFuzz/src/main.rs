@@ -365,6 +365,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     state.set_corpus_id(corpus_id).unwrap();
+                    // 새 샘플을 시작하므로, 직전 커버리지는 baseline 처리
+                    executor.ignore_current_coverage();
 
                     // compute a quick fingerprint of the input bytes so we can identify it in the logs
                     let mut dbg_hasher = AHasher::default();
@@ -405,7 +407,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 exec_before,
                                 exec_after
                             );
-                        } else {
+                    } else {
                             dbgln!(
                                 "[Thread {}] exec {}→{} (no new cov)",
                                 thread_id,
@@ -438,9 +440,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
                     }
-                    // Tell TinyInst to ignore (baseline) the coverage we just saw,
-                    // so subsequent iterations only report *new* edges.
-                    }
+
+                    // Baseline coverage so the next iteration only reports *new* edges,
+                    // mimicking Jackalope's incremental strategy.
+                    executor.ignore_current_coverage();
+
                     {
                     let mut sh = ctx.shared.write().unwrap();
                     // update metadata counters
@@ -500,11 +504,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // --------------------------------------------------------------------
                         }
                     }
-                } else {
-                    thread::sleep(Duration::from_millis(100));
-                }
+                } // end of `for _i in 0..BATCH`
+            } else {
+                thread::sleep(Duration::from_millis(100));
             }
-        }));
+            }
+         }));
     }
 
     // ── Periodic stats reporter ──

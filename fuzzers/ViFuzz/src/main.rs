@@ -41,9 +41,14 @@ use libafl::corpus::HasCurrentCorpusId;
 use libafl_bolts::{rands::StdRand, tuples::tuple_list};
 use libafl_tinyinst::executor::TinyInstExecutor;
 use walkdir::WalkDir;
-
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use once_cell::sync::Lazy; 
 /// 커버리지 맵 크기
 const MAP_SIZE: usize = 65536;
+/// Global counters for periodic statistics
+static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_COV: Lazy<Vec<AtomicU8>> =
+    Lazy::new(|| (0..MAP_SIZE).map(|_| AtomicU8::new(0)).collect());
 
 /// 한 번 잡은 코퍼스 입력에 대해 몇 번 Mutate+Execute 할지
 const BATCH: usize = 100;
@@ -138,6 +143,12 @@ impl SharedCorpus {
     fn requeue(&mut self, idx: usize, prio: usize) {
         if !self.discarded[idx] {
             self.queue.push((Reverse(prio), idx));
+            dbgln!(
+                "requeue: idx={} prio={}  → queue_len={}",
+                idx,
+                prio,
+                self.queue.len()
+            );
         }
     }
 
@@ -300,6 +311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut executor = TinyInstExecutor::builder()
                 .tinyinst_args(tinyinst_args)
                 .program_args(target_args)
+                .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 10000)
                 .timeout(Duration::from_millis(timeout))
                 .coverage_ptr(cov_ptr)
                 .build(tuple_list!(map_observer, time_observer)).unwrap();
@@ -394,6 +406,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 exec_after
                             );
                         }
+                    // ── update global stats ──
+                    let exec_delta = exec_after - exec_before;
+                    GLOBAL_EXECS.fetch_add(exec_delta as u64, Ordering::Relaxed);
+                    for &off in executor.hit_offsets() {
+                        let off_usize = off as usize;              // u64 → usize
+                        if off_usize < MAP_SIZE {
+                            GLOBAL_COV[off_usize].store(1, Ordering::Relaxed);
+                        }
+                    }
                     }
                     {
                     let mut sh = ctx.shared.write().unwrap();
@@ -428,21 +449,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
 
                         if let Some(bytes_vec) = bytes_vec_opt {
-                            // --------------------------------------------------------------------
-                            // 1) compute a simple coverage fingerprint from the current hit offsets
-                            // --------------------------------------------------------------------
+                            // 1) compute a fingerprint from the sample bytes (same scheme as initial load)
                             let mut hasher = AHasher::default();
-                            for off in executor.hit_offsets().iter() {
-                                off.hash(&mut hasher);
-                            }
-                            let cov_fp = hasher.finish();
+                            bytes_vec.hash(&mut hasher);
+                            let sample_fp = hasher.finish();
 
                             // --------------------------------------------------------------------
                             // 2) push the new sample into the shared corpus (if unique)
                             // --------------------------------------------------------------------
                             {
                                 let mut sh = ctx.shared.write().unwrap();
-                                sh.push(BytesInput::new(bytes_vec.clone()), cov_fp);
+                                sh.push(BytesInput::new(bytes_vec.clone()), sample_fp);
                                 let (tot, disc) = sh.stats();
                                 dbgln!(
                                     "[Thread {}] ▶ shared.push() – new total {}, discarded {}",
@@ -465,6 +482,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }));
     }
 
+    // ── Periodic stats reporter ──
+    {
+        let shared_stats = shared.clone();
+        handles.push(thread::spawn(move || {
+            let mut prev_execs = 0u64;
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
+                let speed = execs - prev_execs;
+                prev_execs = execs;
+
+                // unique sample / discarded counts
+                let (total_samples, discarded_samples) = {
+                    let sh = shared_stats.read().unwrap();
+                    sh.stats()
+                };
+
+                // total unique coverage offsets
+                let mut cov_cnt = 0usize;
+                for slot in GLOBAL_COV.iter() {
+                    if slot.load(Ordering::Relaxed) != 0 {
+                        cov_cnt += 1;
+                    }
+                }
+
+                println!(
+                    "[{:?}] STATS: cov_offsets {:>6}, samples {:>6} (discarded {:>6}), exec/s {:>10}, total_execs {:>12}",
+                    Instant::now(),
+                    cov_cnt,
+                    total_samples,
+                    discarded_samples,
+                    speed,
+                    execs
+                );
+            }
+        }));
+    }
     // 5) 조인
     for h in handles {
         let _ = h.join();

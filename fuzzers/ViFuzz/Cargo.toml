@@ -12,6 +12,8 @@ clap = { version = "4.0", features = ["derive"] }
 ctrlc = "3.2"
 env_logger = "0.11.8"
 rand = "0.9.0"
+walkdir = "2.5"
+ahash = "0.8"
 
 [profile.release]
 codegen-units = 1

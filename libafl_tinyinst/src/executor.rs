@@ -91,14 +91,14 @@ where
             
             // Filter out already-seen offsets and notify observers of only new ones
             let cov_vec = self.coverage_ptr.as_mut().unwrap();
-            let mut new_hits = Vec::new();
-            for &off in cov_vec.iter() {
-                if self.hit_offsets.insert(off) {
-                    new_hits.push(off);
-                }
-            }
+           // let mut new_hits = Vec::new();
+
+            /////// println!("Coverage vector: {:?}", cov_vec);
+            
+            self.hit_offsets.extend(cov_vec.drain(..));
+            //////// println!("Hit offsets: {:?}", self.hit_offsets);
             // Mark current coverage as baseline so the next run only reports new edges
-            self.ignore_current_coverage();
+            //self.ignore_current_coverage();
             // clear the coverage buffer for next run
             cov_vec.clear();
         }
@@ -138,6 +138,12 @@ impl<S, SHM, OT> TinyInstExecutor<S, SHM, OT> {
     pub fn hit_offsets(&self) -> &HashSet<u64> {
         &self.hit_offsets
     }
+    //executor.hit_offsets_mut().clear();구현해
+    /// Clear the hit offsets
+    pub fn hit_offsets_mut(&mut self) -> &mut HashSet<u64> {
+        &mut self.hit_offsets
+    }
+    /// clear the hit offsets
 
     /// Baseline (ignore) whatever coverage TinyInst has recorded up to now.
     /// This mimics Jackalope's incremental‑coverage strategy.

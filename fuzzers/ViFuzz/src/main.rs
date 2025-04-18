@@ -50,15 +50,17 @@ const MAP_BYTES: usize = MAP_SIZE * 8;
 
 /// Global counters for periodic statistics
 static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
+
+/// 단순 예전 방식으로 offset별로 저장하던 배열(지금은 안 써도 OK)
 static GLOBAL_COV: Lazy<Vec<AtomicU8>> =
     Lazy::new(|| (0..MAP_BYTES).map(|_| AtomicU8::new(0)).collect());
 
 /// Maximum hit_offsets() length observed in any thread
 static GLOBAL_MAX_THREAD_COV: AtomicUsize = AtomicUsize::new(0);
-/// Number of distinct offsets ever hit (global)
+/// **신규로 발견된 offsets 총 개수** (이제는 hit_offsets().len()만큼 누적)
 static GLOBAL_UNIQUE_OFFSETS: AtomicUsize = AtomicUsize::new(0);
 
-/// 전역으로 공유할 오프셋 모음 (모든 스레드가 hits를 추가)
+/// 전역으로 공유할 오프셋 모음 (디버깅용)
 static GLOBAL_SHARED_OFFSETS: Lazy<Mutex<HashSet<u64>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// 한 번 잡은 코퍼스 입력에 대해 몇 번 Mutate+Execute 할지
@@ -194,9 +196,6 @@ impl ThreadContext {
     fn synchronize_and_get_job(&mut self) -> Option<usize> {
         let t0 = Instant::now();
 
-        // If we already have a previously‑fetched job, return it first.
-        // (We no longer keep a separate local queue – 1 outstanding job per thread is enough.)
-        // Instead, we’ll go back to the global queue every call.
         {
             let sh_read = self.shared.read().unwrap();
             if self.local.len() < sh_read.all.len() {
@@ -205,7 +204,6 @@ impl ThreadContext {
             }
         }
 
-        // Grab one job from the shared queue (write‑lock because we pop).
         let idx_opt = {
             let mut sh = self.shared.write().unwrap();
             let idx = sh.pop_job();
@@ -242,7 +240,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.tinyinst_module.clone(),
             "-generate_unwind".into(),
         ];
-        if let Some(x) = &config.tinyinst_extra { v.push(x.clone()); }
+        if let Some(x) = &config.tinyinst_extra {
+            v.push(x.clone());
+        }
         v
     };
     let mut target_args = vec![config.target.to_string_lossy().into_owned()];
@@ -255,7 +255,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for entry in WalkDir::new(&corpus_path)
             .follow_links(true)
             .into_iter()
-            .filter_map(|e| e.ok()) {
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path().to_path_buf();
             if path.is_file() {
                 if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
@@ -313,6 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &mut feedback,
                 &mut objective,
             ).unwrap();
+
             // seed the state corpus from the initial directory
             for _ in state.corpus().ids() { /* no-op */ }
 
@@ -347,8 +349,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(idx) = ctx.synchronize_and_get_job() {
                     // ── ensure this SharedCorpus input is in the LibAFL state corpus ──
                     let corpus_id = {
-                        let input_bytes = ctx.local[idx].clone(); // BytesInput already
-                        // check if already added via simple hash match; if not, add
+                        let input_bytes = ctx.local[idx].clone(); // BytesInput
                         let mut found = None;
                         for id in state.corpus().ids() {
                             if let Ok(cell) = state.corpus().get(id) {
@@ -372,10 +373,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     };
                     state.set_corpus_id(corpus_id).unwrap();
-                    // 새 샘플을 시작하므로, 직전 커버리지는 baseline 처리
-                    executor.ignore_current_coverage();
 
-                    // compute a quick fingerprint of the input bytes so we can identify it in the logs
+                    // compute a quick fingerprint of the input bytes for log
                     let mut dbg_hasher = AHasher::default();
                     ctx.local[idx].as_ref().hash(&mut dbg_hasher);
                     let input_fp = dbg_hasher.finish();
@@ -389,84 +388,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         input_fp,
                         corpus_id
                     );
-
+                    
                     let mut had_new_cov = false;
                     for _i in 0..BATCH {
                         let exec_before = *state.executions();
-                        let cov_before_iter  = executor.hit_offsets().len();
-
+                        // 실제 fuzz_one 실행
                         if let Err(e) = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr) {
                             eprintln!("Error during fuzzing: {:?}", e);
                             break;
                         }
-
                         let exec_after = *state.executions();
-                        let cov_after_iter  = executor.hit_offsets().len();
-                        let cov_delta = cov_after_iter.saturating_sub(cov_before_iter);
+                        // 이제 hit_offsets()가 이번 fuzz 실행에서 새로 발견된 offset들만 담고 있다고 가정
+                        let new_hits_count = executor.hit_offsets().len() as u64;
+                        if new_hits_count > 0 {
+                            GLOBAL_UNIQUE_OFFSETS.fetch_add(new_hits_count as usize, Ordering::Relaxed);
+                          
+                            had_new_cov = true;
+                        }
+                    
+                        // 다음 배치를 위해 새로 발견된 오프셋 목록을 비움
+                        executor.hit_offsets_mut().clear();
 
-                        // 모든 쓰레드가 hit_offsets를 공유하도록 저장
-                        for &off in executor.hit_offsets() {
-                            // 새로 추가된 offset을 글로벌 해시셋에 기록
+                        // (변경 사항) 발견된 offset의 개수만큼 전역 카운터에 더해준다
+
+                        // 디버깅용: 어떤 offset이 추가로 찍혔는지 보고 싶으면 아래 로직
+              /*          for &off in executor.hit_offsets() {
                             let mut global_offs = GLOBAL_SHARED_OFFSETS.lock().unwrap();
                             global_offs.insert(off);
                         }
+ */
 
-                        // 각 이터마다 글로벌 해시셋의 길이 출력
-                        dbgln!(
-                            "[Thread {}] GLOBAL_SHARED_OFFSETS len: {}",
-                            thread_id,
-                            GLOBAL_SHARED_OFFSETS.lock().unwrap().len()
-                        );
 
-                        // Log the hit offsets for debugging purposes
-/*                    dbgln!(
+
+                   /*    dbgln!(
                             "[Thread {}] Hit offsets: {:?}",
                             thread_id,
                             executor.hit_offsets()
                         );
-*/
-                        dbgln!(
-                            "[Thread {}] cov {} (+{})  execs {}→{}",
-                            thread_id,
-                            cov_after_iter,
-                            cov_delta,
-                            exec_before,
-                            exec_after
-                        );
-
-                        if cov_delta > 0 {
-                            had_new_cov = true;
+ */                     
+                        if new_hits_count == 0 {
+                            dbgln!(
+                                "[Thread {}] cov {}  execs {}→{}",
+                                thread_id,
+                                GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed)-new_hits_count as usize,
+                                exec_before,
+                                exec_after
+                            );
                         }
+                        else {
+                            dbgln!(
+                                "[Thread {}] cov {} (+{})  execs {}→{}",
+                                thread_id,
+                                GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed)-new_hits_count as usize,
+                                new_hits_count,
+                                exec_before,
+                                exec_after
+                            );
+                        }
+                        
+
                         // ── update global stats ──
                         let exec_delta = exec_after - exec_before;
                         GLOBAL_EXECS.fetch_add(exec_delta as u64, Ordering::Relaxed);
-                        for &off in executor.hit_offsets() {
-                            let off_usize = off as usize; // u64 → usize
-                            if off_usize < MAP_BYTES {
-                                // if this offset was previously 0, mark as hit and increment global unique count
-                                if GLOBAL_COV[off_usize]
-                                    .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
-                                    .is_ok()
-                                {
-                                    GLOBAL_UNIQUE_OFFSETS.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }
-                        }
 
                         // update global per‑thread max coverage length
-                        let len = cov_after_iter as usize;
+                        let len = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
                         let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
                         while len > prev
                             && GLOBAL_MAX_THREAD_COV
                                 .compare_exchange_weak(prev, len, Ordering::Relaxed, Ordering::Relaxed)
                                 .is_err()
                         {
-                            prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+                            prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed)
                         }
-
-                        // Baseline coverage so the next iteration only reports *new* edges,
-                        // mimicking Jackalope's incremental strategy.
-                        executor.ignore_current_coverage();
                     }
 
                     {
@@ -487,7 +481,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if after > 0 {
                         let new_id = after - 1;
 
-                        // ---- clone bytes of newly‑added testcase while immutable borrow alive ----
                         let bytes_vec_opt = state
                             .corpus()
                             .get(CorpusId(new_id))
@@ -500,14 +493,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             });
 
                         if let Some(bytes_vec) = bytes_vec_opt {
-                            // 1) compute a fingerprint from the sample bytes (same scheme as initial load)
                             let mut hasher = AHasher::default();
                             bytes_vec.hash(&mut hasher);
                             let sample_fp = hasher.finish();
 
-                            // --------------------------------------------------------------------
-                            // 2) push the new sample into the shared corpus (if unique)
-                            // --------------------------------------------------------------------
                             {
                                 let mut sh = ctx.shared.write().unwrap();
                                 sh.push(BytesInput::new(bytes_vec.clone()), sample_fp);
@@ -519,8 +508,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     disc
                                 );
                             }
-                            // 3) keep LibAFL state in sync: we already have the testcase at
-                            //    CorpusId(new_id), so just tell the manager about it.
                         }
                     }
                 } else {
@@ -533,30 +520,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Periodic stats reporter ──
     {
         let shared_stats = shared.clone();
-        handles.push(thread::spawn(move || {
-            let mut prev_execs = 0u64;
-            let mut smoothed_speed: u64 = 0;
-            const ALPHA: f64 = 0.2;   // smoothing factor (20 % new, 80 % history)
+        let mut prev_execs = 0u64;
+        let mut smoothed_speed: u64 = 0;
+        const ALPHA: f64 = 0.2;   // smoothing factor
+    
+        thread::spawn(move || {
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
                 let speed = execs - prev_execs;
-                smoothed_speed = ((speed as f64) * ALPHA + (smoothed_speed as f64) * (1.0 - ALPHA)).round() as u64;
+                smoothed_speed = ((speed as f64) * ALPHA
+                                  + (smoothed_speed as f64) * (1.0 - ALPHA))
+                                  .round() as u64;
                 prev_execs = execs;
-
+    
                 // unique sample / discarded counts
                 let (total_samples, discarded_samples) = {
                     let sh = shared_stats.read().unwrap();
                     sh.stats()
                 };
-
-                // total unique offsets ever hit
+    
+                // 누적 offsets 수 (새로 발견된 offset 증가분)
                 let cov_cnt = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
-
+    
+                // 실제로 전역 Set 에 들어가 있는 offsets 개수
+                let offsets_set_size = {
+                    let set = GLOBAL_SHARED_OFFSETS.lock().unwrap();
+                    set.len()
+                };
+    
                 println!(
-                    "[{:?}] STATS: unique_offsets {:>8}, samples {:>6} (discarded {:>6}), exec/s {:>10} (avg {:>10}), total_execs {:>12}",
+                    "[{:?}] STATS: newly_hit_offsets {:>8}, coverage_offsets_set {:>8}, \
+                     samples {:>6} (discarded {:>6}), exec/s {:>10} (avg {:>10}), total_execs {:>12}",
                     Instant::now(),
                     cov_cnt,
+                    offsets_set_size,
                     total_samples,
                     discarded_samples,
                     speed,
@@ -564,12 +562,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     execs
                 );
             }
-        }));
+        });
     }
 
-    // 5) 조인
+    // 5) 여기서는 워커 스레드 조인
     for h in handles {
         let _ = h.join();
     }
+
     Ok(())
 }

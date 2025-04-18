@@ -34,12 +34,12 @@ use walkdir::WalkDir;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
 
-/// simple conditional debug print
+/// simple conditional debug print (now unused)
 macro_rules! dbgln {
     ($($arg:tt)*) => {
-        if DEBUG {
-            println!("[{:?}] {}", Instant::now(), format_args!($($arg)*));
-        }
+        // if DEBUG {
+        //     println!("[{:?}] {}", Instant::now(), format_args!($($arg)*));
+        // }
     };
 }
 
@@ -130,7 +130,6 @@ impl SharedCorpus {
 
     /// 새 테스트케이스 추가 (커버리지 fingerprint 중복 방지)
     fn push(&mut self, input: BytesInput, cov_hash: u64) {
-        // 동일한 coverage fingerprint가 이미 있으면 discard
         if self.fingerprints.contains(&cov_hash) {
             return;
         }
@@ -139,11 +138,9 @@ impl SharedCorpus {
         self.discarded.push(false);
         self.stats.push(SampleStats::default());
         self.fingerprints.insert(cov_hash);
-        // priority = 0 이면 높은 우선순위
         self.queue.push((Reverse(0), idx));
-        // queue 사이즈가 너무 크면 우선순위가 낮은 것을 하나 drop
         if self.queue.len() > 1000 {
-            self.queue.pop(); // drop lowest priority
+            self.queue.pop();
         }
     }
 
@@ -161,19 +158,14 @@ impl SharedCorpus {
     fn requeue(&mut self, idx: usize, prio: usize) {
         if !self.discarded[idx] {
             self.queue.push((Reverse(prio), idx));
-            dbgln!(
-                "requeue: idx={} prio={}  → queue_len={}",
-                idx,
-                prio,
-                self.queue.len()
-            );
+            // dbgln!("requeue: idx={} prio={}  → queue_len={}", idx, prio, self.queue.len());
         }
     }
 
     /// 해당 인덱스를 큐에서 제외
     fn discard(&mut self, idx: usize) {
         self.discarded[idx] = true;
-        dbgln!("discard: idx={}", idx);
+        // dbgln!("discard: idx={}", idx);
     }
 
     /// 반환: (총 샘플 수, discarded 된 것 수)
@@ -206,7 +198,6 @@ impl ThreadContext {
         let t0 = Instant::now();
 
         {
-            // 우선 read 락으로 all[..]을 로컬에 반영
             let sh_read = self.shared.read().unwrap();
             if self.local.len() < sh_read.all.len() {
                 let old = self.local.len();
@@ -214,33 +205,30 @@ impl ThreadContext {
             }
         }
 
-        // 그 뒤 write 락으로 queue에서 하나 pop
         let idx_opt = {
             let mut sh = self.shared.write().unwrap();
             let idx = sh.pop_job();
-            let (total, disc) = sh.stats();
-            dbgln!(
-                "Thread {} sync: SharedCorpus stats – total {}, discarded {}, queue {}",
-                self.id,
-                total,
-                disc,
-                sh.queue.len()
-            );
+            // let (total, disc) = sh.stats();
+            // dbgln!(
+            //     "Thread {} sync: SharedCorpus stats – total {}, discarded {}, queue {}",
+            //     self.id,
+            //     total,
+            //     disc,
+            //     sh.queue.len()
+            // );
             idx
         };
 
-        dbgln!("Thread {} sync elapsed = {:?}", self.id, t0.elapsed());
+        // dbgln!("Thread {} sync elapsed = {:?}", self.id, t0.elapsed());
         idx_opt
     }
 }
 
-const DEBUG: bool = true;
+// const DEBUG: bool = true;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1) CLI 파싱
     let config = Config::parse();
 
-    // 2) 미리 꺼내 쓸 값들
     let corpus_path   = config.corpus_path.clone();
     let crashes_path  = config.crashes_path.clone();
     let num_threads   = config.forks;
@@ -259,7 +247,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut target_args = vec![config.target.to_string_lossy().into_owned()];
     target_args.extend(config.target_args.clone());
 
-    // 3) 전역 SharedCorpus 초기화 (디스크에서 시드 읽기)
     let shared = Arc::new(RwLock::new(SharedCorpus::new()));
     {
         let mut sh = shared.write().unwrap();
@@ -270,32 +257,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let path = entry.path().to_path_buf();
             if path.is_file() {
-                // 숨김 파일 등 제외
                 if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                     if fname.starts_with('.') {
                         continue;
                     }
                 }
                 if let Ok(data) = fs::read(&path) {
-                    let data_len = data.len();
-                    // 파일 내용에 대한 간단 fingerprint
                     let mut hasher = AHasher::default();
                     data.hash(&mut hasher);
                     let fp = hasher.finish();
 
-                    let input = BytesInput::new(data);
-                    sh.push(input, fp);
-                    dbgln!("로드: {} ({} bytes)", path.display(), data_len);
+                    sh.push(BytesInput::new(data), fp);
+                    // dbgln!("로드: {} ({} bytes)", path.display(), data_len);
                 }
             }
         }
     }
-    dbgln!(
-        "초기 SharedCorpus 큐 크기: {}",
-        shared.read().unwrap().all.len()
-    );
+    // dbgln!("초기 SharedCorpus 큐 크기: {}", shared.read().unwrap().all.len());
 
-    // 4) 스레드들 실행
     let mut handles = Vec::new();
     for thread_id in 0..num_threads {
         let shared       = shared.clone();
@@ -306,16 +285,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let corpus_path  = corpus_path.clone();
         let crashes_path = crashes_path.clone();
 
-        // 각 스레드 시작 시 thread_id+1 초 만큼 쉬기
         handles.push(thread::spawn(move || {
-            let sleep_secs = (thread_id + 1) as u64;
-            println!("Thread {thread_id} will sleep {sleep_secs} seconds before starting...");
-            thread::sleep(Duration::from_secs(sleep_secs));
+            // thread::sleep(Duration::from_secs((thread_id + 1) as u64));
 
-            // ── libafl 기본 세팅 ──
             let mut coverage_map = vec![0u64; MAP_SIZE];
             let cov_ptr: *mut Vec<u64> = &mut coverage_map as *mut Vec<u64>;
-            // safety: tinyinst executor가 접근
             let map_observer  = unsafe { StdMapObserver::new("cov", &mut coverage_map) };
             let time_observer = TimeObserver::new("time");
 
@@ -324,7 +298,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut objective = CrashFeedback::new();
 
             let rand = StdRand::new();
-            // dummy corpus; 실제 공유는 SharedCorpus가 담당
             let mut state = StdState::new(
                 rand.clone(),
                 InMemoryOnDiskCorpus::<BytesInput>::new(corpus_path.clone()).unwrap(),
@@ -335,9 +308,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let scheduler = QueueScheduler::new();
             let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
-            let mut mgr = SimpleEventManager::new(MultiMonitor::new(|s| dbgln!("{}", s)));
+            // Suppress multi-monitor debug prints by giving an empty closure
+            let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
 
-            // executor: TinyInst
             let mut executor = TinyInstExecutor::builder()
                 .tinyinst_args(tinyinst_args)
                 .program_args(target_args)
@@ -346,7 +319,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .coverage_ptr(cov_ptr)
                 .build(tuple_list!(map_observer, time_observer)).unwrap();
 
-            // (선택) load_initial_inputs_forced로 최소 한 번은 불러오기
             state
                 .load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_path.clone()])
                 .expect("Failed to load initial inputs");
@@ -354,14 +326,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5).unwrap();
             let mut stages = tuple_list!(StdMutationalStage::new(mopt));
 
-            // ── Jackalope 스타일 런 루프 ──
             let mut ctx = ThreadContext::new(thread_id, shared);
             loop {
-                // 큐에서 하나 가져오기
                 if let Some(idx) = ctx.synchronize_and_get_job() {
-                    // 이 입력을 state corpus에도 반영(없으면 추가)
                     let corpus_id = {
-                        let input_bytes = ctx.local[idx].clone(); // BytesInput
+                        let input_bytes = ctx.local[idx].clone();
                         let mut found = None;
                         for id in state.corpus().ids() {
                             if let Ok(cell) = state.corpus().get(id) {
@@ -386,57 +355,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     state.set_corpus_id(corpus_id).unwrap();
 
-                    // 디버그용 fingerprint
-                    let mut dbg_hasher = AHasher::default();
-                    ctx.local[idx].as_ref().hash(&mut dbg_hasher);
-                    let input_fp = dbg_hasher.finish();
-                    let input_len = ctx.local[idx].as_ref().len();
+                    // let mut dbg_hasher = AHasher::default();
+                    // ctx.local[idx].as_ref().hash(&mut dbg_hasher);
+                    // let input_fp = dbg_hasher.finish();
+                    // let input_len = ctx.local[idx].as_ref().len();
 
-                    dbgln!(
-                        "[Thread {}] Fuzzing idx {} (len {:>6}, hash {:#016x})  ─ corpus_id = {:?}",
-                        thread_id,
-                        idx,
-                        input_len,
-                        input_fp,
-                        corpus_id
-                    );
+                    // dbgln!(
+                    //     "[Thread {}] Fuzzing idx {} (len {:>6}, hash {:#016x})  ─ corpus_id = {:?}",
+                    //     thread_id,
+                    //     idx,
+                    //     input_len,
+                    //     input_fp,
+                    //     corpus_id
+                    // );
 
                     let mut had_new_cov = false;
                     for _i in 0..BATCH {
                         let exec_before = *state.executions();
 
-                        // fuzz_one 실행
-                        if let Err(e) = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
-                        {
-                            eprintln!("Error during fuzzing: {:?}", e);
+                        if let Err(_e) = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr) {
+                            // Commenting out error print
+                            // eprintln!("Error during fuzzing: {:?}", e);
                             break;
                         }
                         let exec_after = *state.executions();
+                        GLOBAL_EXECS.fetch_add((exec_after - exec_before) as u64, Ordering::Relaxed);
 
-                        // ── 새로 발견된 offsets 처리 ──
                         let hits = executor.hit_offsets();
                         let mut newly_found = 0;
                         {
                             let mut global_offs = GLOBAL_SHARED_OFFSETS.lock().unwrap();
-                            // HashSet::insert가 true면 전역적으로 처음 보는 offset
                             for &off in hits {
                                 if global_offs.insert(off) {
                                     newly_found += 1;
                                 }
                             }
                         }
-                        // 새 offset이 하나 이상이면 had_new_cov = true
                         if newly_found > 0 {
                             GLOBAL_UNIQUE_OFFSETS.fetch_add(newly_found, Ordering::Relaxed);
                             had_new_cov = true;
                         }
-                        // 다음 배치를 위해 hit_offsets() 클리어
                         executor.hit_offsets_mut().clear();
 
-                        // global execs
-                        GLOBAL_EXECS.fetch_add((exec_after - exec_before) as u64, Ordering::Relaxed);
-
-                        // 전역 per‑thread max coverage length 갱신
                         let len = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
                         let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
                         while len > prev
@@ -453,7 +413,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // 이 입력의 메타데이터 갱신 (run 횟수 등)
                     {
                         let mut sh = ctx.shared.write().unwrap();
                         let s = &mut sh.stats[idx];
@@ -461,15 +420,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if had_new_cov {
                             s.num_newcov += 1;
                         }
-                        // 새 커버 없으면 priority 3으로
                         let prio = if had_new_cov { 0 } else { 3 };
                         sh.requeue(idx, prio);
                     }
 
-                    // LibAFL state corpus에 새로 추가된 Testcase 있는지 확인
                     let after = state.corpus().count();
                     if after > 0 {
-                        // 최근 추가된 id = after - 1
                         let new_id = after - 1;
                         let bytes_vec_opt = state
                             .corpus()
@@ -486,25 +442,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 let mut sh = ctx.shared.write().unwrap();
                                 sh.push(BytesInput::new(bytes_vec.clone()), sample_fp);
-                                let (tot, disc) = sh.stats();
-                                dbgln!(
-                                    "[Thread {}] ▶ shared.push() – new total {}, discarded {}",
-                                    thread_id,
-                                    tot,
-                                    disc
-                                );
+                                // let (tot, disc) = sh.stats();
+                                // dbgln!(
+                                //     "[Thread {}] ▶ shared.push() – new total {}, discarded {}",
+                                //     thread_id,
+                                //     tot,
+                                //     disc
+                                // );
                             }
                         }
                     }
                 } else {
-                    // 큐가 비어 있다면 대기
+                    // Comment out this debug message
+                    // println!("Thread {}: no jobs left, sleeping...", thread_id);
                     thread::sleep(Duration::from_millis(100));
                 }
             }
         }));
     }
 
-    // ── 주기적으로 통계 찍기 ──
     {
         let shared_stats = shared.clone();
         let mut prev_execs = 0u64;
@@ -521,26 +477,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                   .round() as u64;
                 prev_execs = execs;
 
-                // SharedCorpus 내의 샘플 / discarded 개수
                 let (total_samples, discarded_samples) = {
                     let sh = shared_stats.read().unwrap();
                     sh.stats()
                 };
 
-                // 지금까지 발견한 '진짜 새로운 offset' 총 개수
                 let cov_cnt = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
-
-                // 실제 전역 Set에 들어가 있는 offsets 개수
                 let offsets_set_size = {
                     let set = GLOBAL_SHARED_OFFSETS.lock().unwrap();
                     set.len()
                 };
 
+                // **유일하게 남긴 출력 (STATS)**
                 println!(
-                    "[{:?}] STATS: newly_hit_offsets {:>8}, coverage_offsets_set {:>8}, \
+                    "[ViFuzz] STATS: coverage {:>8}, \
                      samples {:>6} (discarded {:>6}), exec/s {:>10} (avg {:>10}), total_execs {:>12}",
-                    Instant::now(),
-                    cov_cnt,
+                    
                     offsets_set_size,
                     total_samples,
                     discarded_samples,
@@ -552,7 +504,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // 5) 워커 스레드 조인
     for h in handles {
         let _ = h.join();
     }

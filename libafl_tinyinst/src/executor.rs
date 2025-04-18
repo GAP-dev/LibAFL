@@ -97,6 +97,8 @@ where
                     new_hits.push(off);
                 }
             }
+            // Mark current coverage as baseline so the next run only reports new edges
+            self.ignore_current_coverage();
             // clear the coverage buffer for next run
             cov_vec.clear();
         }
@@ -135,6 +137,13 @@ impl<S, SHM, OT> TinyInstExecutor<S, SHM, OT> {
     /// 반환: 누적된 hit offset 집합에 대한 참조
     pub fn hit_offsets(&self) -> &HashSet<u64> {
         &self.hit_offsets
+    }
+
+    /// Baseline (ignore) whatever coverage TinyInst has recorded up to now.
+    /// This mimics Jackalope's incremental‑coverage strategy.
+    pub fn ignore_current_coverage(&mut self) {
+        let mut _scratch: Vec<u64> = Vec::new();
+        self.tinyinst.vec_coverage(&mut _scratch, true);
     }
 }
 

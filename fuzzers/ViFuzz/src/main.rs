@@ -41,14 +41,21 @@ use libafl::corpus::HasCurrentCorpusId;
 use libafl_bolts::{rands::StdRand, tuples::tuple_list};
 use libafl_tinyinst::executor::TinyInstExecutor;
 use walkdir::WalkDir;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use once_cell::sync::Lazy; 
 /// 커버리지 맵 크기
 const MAP_SIZE: usize = 65536;
+/// TinyInst gives byte‑level offsets; each u64 word covers 8 bytes.
+const MAP_BYTES: usize = MAP_SIZE * 8;
 /// Global counters for periodic statistics
 static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_COV: Lazy<Vec<AtomicU8>> =
-    Lazy::new(|| (0..MAP_SIZE).map(|_| AtomicU8::new(0)).collect());
+    Lazy::new(|| (0..MAP_BYTES).map(|_| AtomicU8::new(0)).collect());
+
+/// Maximum hit_offsets() length observed in any thread
+static GLOBAL_MAX_THREAD_COV: AtomicUsize = AtomicUsize::new(0);
+/// Number of distinct offsets ever hit (global)
+static GLOBAL_UNIQUE_OFFSETS: AtomicUsize = AtomicUsize::new(0);
 
 /// 한 번 잡은 코퍼스 입력에 대해 몇 번 Mutate+Execute 할지
 const BATCH: usize = 100;
@@ -411,10 +418,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     GLOBAL_EXECS.fetch_add(exec_delta as u64, Ordering::Relaxed);
                     for &off in executor.hit_offsets() {
                         let off_usize = off as usize;              // u64 → usize
-                        if off_usize < MAP_SIZE {
-                            GLOBAL_COV[off_usize].store(1, Ordering::Relaxed);
+                        if off_usize < MAP_BYTES {
+                            // if this offset was previously 0, mark as hit and increment global unique count
+                            if GLOBAL_COV[off_usize]
+                                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_ok()
+                            {
+                                GLOBAL_UNIQUE_OFFSETS.fetch_add(1, Ordering::Relaxed);
+                            }
                         }
                     }
+                    // update global per‑thread max coverage length
+                    let len = cov_after_iter as usize;
+                    let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+                    while len > prev
+                        && GLOBAL_MAX_THREAD_COV
+                            .compare_exchange_weak(prev, len, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_err()
+                    {
+                        prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+                    }
+                    // Tell TinyInst to ignore (baseline) the coverage we just saw,
+                    // so subsequent iterations only report *new* edges.
                     }
                     {
                     let mut sh = ctx.shared.write().unwrap();
@@ -487,10 +512,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let shared_stats = shared.clone();
         handles.push(thread::spawn(move || {
             let mut prev_execs = 0u64;
+            let mut smoothed_speed: u64 = 0;
+            const ALPHA: f64 = 0.2;   // smoothing factor (20 % new, 80 % history)
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
                 let speed = execs - prev_execs;
+                smoothed_speed = ((speed as f64) * ALPHA + (smoothed_speed as f64) * (1.0 - ALPHA)).round() as u64;
                 prev_execs = execs;
 
                 // unique sample / discarded counts
@@ -499,21 +527,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     sh.stats()
                 };
 
-                // total unique coverage offsets
-                let mut cov_cnt = 0usize;
-                for slot in GLOBAL_COV.iter() {
-                    if slot.load(Ordering::Relaxed) != 0 {
-                        cov_cnt += 1;
-                    }
-                }
+                // total unique offsets ever hit
+                let cov_cnt = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
 
                 println!(
-                    "[{:?}] STATS: cov_offsets {:>6}, samples {:>6} (discarded {:>6}), exec/s {:>10}, total_execs {:>12}",
+                "[{:?}] STATS: unique_offsets {:>8}, samples {:>6} (discarded {:>6}), exec/s {:>10} (avg {:>10}), total_execs {:>12}",
                     Instant::now(),
                     cov_cnt,
                     total_samples,
                     discarded_samples,
                     speed,
+                    smoothed_speed,
                     execs
                 );
             }

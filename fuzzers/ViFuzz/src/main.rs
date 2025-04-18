@@ -1,25 +1,15 @@
 use std::{
-    collections::{BinaryHeap},
+    collections::{BinaryHeap, HashSet},
     cmp::Reverse,
     fs,
     hash::{Hash, Hasher},
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Mutex},
     thread,
     time::{Duration, Instant},
 };
-use std::collections::HashSet;
 use clap::Parser;
 use ahash::AHasher;
-use libafl_bolts::HasLen;
-/// simple conditional debug print
-macro_rules! dbgln {
-    ($($arg:tt)*) => {
-        if DEBUG {
-            println!("[{:?}] {}", Instant::now(), format_args!($($arg)*));
-        }
-    };
-}
 
 use libafl::{
     corpus::{InMemoryOnDiskCorpus, OnDiskCorpus, CorpusId, Testcase},
@@ -42,11 +32,22 @@ use libafl_bolts::{rands::StdRand, tuples::tuple_list};
 use libafl_tinyinst::executor::TinyInstExecutor;
 use walkdir::WalkDir;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use once_cell::sync::Lazy; 
+use once_cell::sync::Lazy;
+
+/// simple conditional debug print
+macro_rules! dbgln {
+    ($($arg:tt)*) => {
+        if DEBUG {
+            println!("[{:?}] {}", Instant::now(), format_args!($($arg)*));
+        }
+    };
+}
+
 /// 커버리지 맵 크기
 const MAP_SIZE: usize = 65536;
 /// TinyInst gives byte‑level offsets; each u64 word covers 8 bytes.
 const MAP_BYTES: usize = MAP_SIZE * 8;
+
 /// Global counters for periodic statistics
 static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_COV: Lazy<Vec<AtomicU8>> =
@@ -56,6 +57,9 @@ static GLOBAL_COV: Lazy<Vec<AtomicU8>> =
 static GLOBAL_MAX_THREAD_COV: AtomicUsize = AtomicUsize::new(0);
 /// Number of distinct offsets ever hit (global)
 static GLOBAL_UNIQUE_OFFSETS: AtomicUsize = AtomicUsize::new(0);
+
+/// 전역으로 공유할 오프셋 모음 (모든 스레드가 hits를 추가)
+static GLOBAL_SHARED_OFFSETS: Lazy<Mutex<HashSet<u64>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// 한 번 잡은 코퍼스 입력에 대해 몇 번 Mutate+Execute 할지
 const BATCH: usize = 100;
@@ -100,14 +104,16 @@ struct SampleStats {
     num_hangs: u64,
     num_newcov: u64,
 }
+
 /// Jackalope 스타일 전역 공유 코퍼스
 struct SharedCorpus {
     all: Vec<BytesInput>,
     discarded: Vec<bool>,
     queue: BinaryHeap<(Reverse<usize>, usize)>, // (priority, idx)
     fingerprints: HashSet<u64>, // simple coverage hash
-    stats: Vec<SampleStats>,   // per‑sample metadata
+    stats: Vec<SampleStats>,    // per‑sample metadata
 }
+
 impl SharedCorpus {
     fn new() -> Self {
         SharedCorpus {
@@ -118,6 +124,7 @@ impl SharedCorpus {
             stats: Vec::new(),
         }
     }
+
     /// 새 테스트케이스 추가
     fn push(&mut self, input: BytesInput, cov_hash: u64) {
         // 동일한 coverage fingerprint 가 이미 있으면 discard
@@ -177,6 +184,7 @@ struct ThreadContext {
     shared: Arc<RwLock<SharedCorpus>>,
     local: Vec<BytesInput>,
 }
+
 impl ThreadContext {
     fn new(id: usize, shared: Arc<RwLock<SharedCorpus>>) -> Self {
         ThreadContext { id, shared, local: Vec::new() }
@@ -185,7 +193,7 @@ impl ThreadContext {
     /// Jackalope 의 SynchronizeAndGetJob
     fn synchronize_and_get_job(&mut self) -> Option<usize> {
         let t0 = Instant::now();
- 
+
         // If we already have a previously‑fetched job, return it first.
         // (We no longer keep a separate local queue – 1 outstanding job per thread is enough.)
         // Instead, we’ll go back to the global queue every call.
@@ -196,7 +204,7 @@ impl ThreadContext {
                 self.local.extend_from_slice(&sh_read.all[old..]);
             }
         }
- 
+
         // Grab one job from the shared queue (write‑lock because we pop).
         let idx_opt = {
             let mut sh = self.shared.write().unwrap();
@@ -211,7 +219,7 @@ impl ThreadContext {
             );
             idx
         };
- 
+
         dbgln!("Thread {} sync elapsed = {:?}", self.id, t0.elapsed());
         idx_opt
     }
@@ -359,7 +367,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .corpus_mut()
                                     .add(Testcase::new(input_bytes.clone()))
                                     .unwrap();
-                                // mgr.on_new_testcase(&state, &fuzzer, id).unwrap();
                                 id
                             }
                         }
@@ -372,7 +379,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut dbg_hasher = AHasher::default();
                     ctx.local[idx].as_ref().hash(&mut dbg_hasher);
                     let input_fp = dbg_hasher.finish();
-                    let input_len = ctx.local[idx].len();
+                    let input_len = ctx.local[idx].as_ref().len();
 
                     dbgln!(
                         "[Thread {}] Fuzzing idx {} (len {:>6}, hash {:#016x})  ─ corpus_id = {:?}",
@@ -395,72 +402,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let exec_after = *state.executions();
                         let cov_after_iter  = executor.hit_offsets().len();
+                        let cov_delta = cov_after_iter.saturating_sub(cov_before_iter);
 
-                        if cov_after_iter > cov_before_iter {
-                            had_new_cov = true;
-                            dbgln!(
-                                "[Thread {}] +cov: {} → {} (Δ {})  execs {}→{}",
-                                thread_id,
-                                cov_before_iter,
-                                cov_after_iter,
-                                cov_after_iter - cov_before_iter,
-                                exec_before,
-                                exec_after
-                            );
-                    } else {
-                            dbgln!(
-                                "[Thread {}] exec {}→{} (no new cov)",
-                                thread_id,
-                                exec_before,
-                                exec_after
-                            );
+                        // 모든 쓰레드가 hit_offsets를 공유하도록 저장
+                        for &off in executor.hit_offsets() {
+                            // 새로 추가된 offset을 글로벌 해시셋에 기록
+                            let mut global_offs = GLOBAL_SHARED_OFFSETS.lock().unwrap();
+                            global_offs.insert(off);
                         }
-                    // ── update global stats ──
-                    let exec_delta = exec_after - exec_before;
-                    GLOBAL_EXECS.fetch_add(exec_delta as u64, Ordering::Relaxed);
-                    for &off in executor.hit_offsets() {
-                        let off_usize = off as usize;              // u64 → usize
-                        if off_usize < MAP_BYTES {
-                            // if this offset was previously 0, mark as hit and increment global unique count
-                            if GLOBAL_COV[off_usize]
-                                .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
-                                .is_ok()
-                            {
-                                GLOBAL_UNIQUE_OFFSETS.fetch_add(1, Ordering::Relaxed);
+
+                        // 각 이터마다 글로벌 해시셋의 길이 출력
+                        dbgln!(
+                            "[Thread {}] GLOBAL_SHARED_OFFSETS len: {}",
+                            thread_id,
+                            GLOBAL_SHARED_OFFSETS.lock().unwrap().len()
+                        );
+
+                        // Log the hit offsets for debugging purposes
+/*                    dbgln!(
+                            "[Thread {}] Hit offsets: {:?}",
+                            thread_id,
+                            executor.hit_offsets()
+                        );
+*/
+                        dbgln!(
+                            "[Thread {}] cov {} (+{})  execs {}→{}",
+                            thread_id,
+                            cov_after_iter,
+                            cov_delta,
+                            exec_before,
+                            exec_after
+                        );
+
+                        if cov_delta > 0 {
+                            had_new_cov = true;
+                        }
+                        // ── update global stats ──
+                        let exec_delta = exec_after - exec_before;
+                        GLOBAL_EXECS.fetch_add(exec_delta as u64, Ordering::Relaxed);
+                        for &off in executor.hit_offsets() {
+                            let off_usize = off as usize; // u64 → usize
+                            if off_usize < MAP_BYTES {
+                                // if this offset was previously 0, mark as hit and increment global unique count
+                                if GLOBAL_COV[off_usize]
+                                    .compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed)
+                                    .is_ok()
+                                {
+                                    GLOBAL_UNIQUE_OFFSETS.fetch_add(1, Ordering::Relaxed);
+                                }
                             }
                         }
+
+                        // update global per‑thread max coverage length
+                        let len = cov_after_iter as usize;
+                        let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+                        while len > prev
+                            && GLOBAL_MAX_THREAD_COV
+                                .compare_exchange_weak(prev, len, Ordering::Relaxed, Ordering::Relaxed)
+                                .is_err()
+                        {
+                            prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+                        }
+
+                        // Baseline coverage so the next iteration only reports *new* edges,
+                        // mimicking Jackalope's incremental strategy.
+                        executor.ignore_current_coverage();
                     }
-                    // update global per‑thread max coverage length
-                    let len = cov_after_iter as usize;
-                    let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
-                    while len > prev
-                        && GLOBAL_MAX_THREAD_COV
-                            .compare_exchange_weak(prev, len, Ordering::Relaxed, Ordering::Relaxed)
-                            .is_err()
+
                     {
-                        prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+                        let mut sh = ctx.shared.write().unwrap();
+                        // update metadata counters
+                        let s = &mut sh.stats[idx];
+                        s.num_runs += BATCH as u64;
+                        if had_new_cov {
+                            s.num_newcov += 1;
+                        }
+                        // schedule back into the queue
+                        let prio = if had_new_cov { 0 } else { 3 };
+                        sh.requeue(idx, prio);
                     }
 
-                    // Baseline coverage so the next iteration only reports *new* edges,
-                    // mimicking Jackalope's incremental strategy.
-                    executor.ignore_current_coverage();
-
-                    {
-                    let mut sh = ctx.shared.write().unwrap();
-                    // update metadata counters
-                    let s = &mut sh.stats[idx];
-                    s.num_runs += BATCH as u64;
-                    if had_new_cov {
-                        s.num_newcov += 1;
-                    }
-                    // TODO: num_crashes / num_hangs could be updated via observers
-
-                    // schedule back into the queue
-                    let prio = if had_new_cov { 0 } else { 3 };
-                    sh.requeue(idx, prio);
-                }
                     // detect newly added testcase in the corpus
-                    // fuzz_one has already been called above, check if corpus grew
                     let after = state.corpus().count();
                     if after > 0 {
                         let new_id = after - 1;
@@ -497,19 +519,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     disc
                                 );
                             }
-
-                            // --------------------------------------------------------------------
                             // 3) keep LibAFL state in sync: we already have the testcase at
                             //    CorpusId(new_id), so just tell the manager about it.
-                            // --------------------------------------------------------------------
                         }
                     }
-                } // end of `for _i in 0..BATCH`
-            } else {
-                thread::sleep(Duration::from_millis(100));
+                } else {
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
-            }
-         }));
+        }));
     }
 
     // ── Periodic stats reporter ──
@@ -536,7 +554,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cov_cnt = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
 
                 println!(
-                "[{:?}] STATS: unique_offsets {:>8}, samples {:>6} (discarded {:>6}), exec/s {:>10} (avg {:>10}), total_execs {:>12}",
+                    "[{:?}] STATS: unique_offsets {:>8}, samples {:>6} (discarded {:>6}), exec/s {:>10} (avg {:>10}), total_execs {:>12}",
                     Instant::now(),
                     cov_cnt,
                     total_samples,
@@ -548,6 +566,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }));
     }
+
     // 5) 조인
     for h in handles {
         let _ = h.join();

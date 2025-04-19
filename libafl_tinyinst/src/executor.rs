@@ -36,6 +36,8 @@ pub struct TinyInstExecutor<S, SHM, OT> {
     cur_input: InputFile,
     map: Option<SHM>,
     hit_offsets: HashSet<u64>,
+    last_crash: Option<(String, bool)>,  // (crash_name, is_unique)
+    last_exit_kind: Option<ExitKind>,
 }
 
 impl TinyInstExecutor<(), NopShMem, ()> {
@@ -123,7 +125,10 @@ where
                 let mut map = UNIQUE_CRASHES.lock().unwrap();
                 let count = map.entry(crash_name.clone()).or_insert(0);
                 *count += 1;
-                if *count == 1 {
+                let is_unique = *count == 1;
+                // main 에 전달하기 위해 저장
+                self.last_crash = Some((crash_name.clone(), is_unique));
+                if is_unique {
                     // 유니크 크래시: 첫 발견
                     // TODO: crash corpus에 저장, 로깅 등
                     eprintln!("[*] New unique crash: {crash_name}");
@@ -135,22 +140,32 @@ where
         }
 
         // 4) 최종 상태에 따라 ExitKind 결정
-        match final_status {
-            // 재시도 끝에 여전히 CRASH/HANG이면 실제 Crash 처리
-            RunResult::CRASH | RunResult::HANG if retry_count == 3 => Ok(ExitKind::Crash),
-
-            // 재시도 중 성공(= OK)으로 돌아왔거나,
+        let exit_kind = match final_status {
+            // 재시도 끝에 여전히 CRASH이면 실제 Crash 처리
+            RunResult::CRASH if retry_count == 3 => ExitKind::Crash,
+            // 재시도 끝에 여전히 HANG이면 Hang으로 간주하여 Timeout 처리
+            RunResult::HANG if retry_count == 3 => ExitKind::Timeout,
+            // 재시도 중에 성공하거나 (즉, OK를 반환했거나),
             // Crash/Hang이지만 retry_count가 3 미만이면 "플레이키"로 간주하여 Ok 처리
-            RunResult::CRASH | RunResult::HANG => Ok(ExitKind::Ok),
+            RunResult::CRASH | RunResult::HANG => ExitKind::Ok,
+            RunResult::OK => ExitKind::Ok,
+            RunResult::OTHER_ERROR => {
+                return Err(Error::unknown(
+                    "Tinyinst RunResult is other error".to_string(),
+                ));
+            },
+            _ => {
+                return Err(Error::unknown(
+                    "Tinyinst RunResult is unknown".to_string(),
+                ));
+            },
+        };
 
-            RunResult::OK => Ok(ExitKind::Ok),
-            RunResult::OTHER_ERROR => Err(Error::unknown(
-                "Tinyinst RunResult is other error".to_string(),
-            )),
-            _ => Err(Error::unknown(
-                "Tinyinst RunResult is unknown".to_string(),
-            )),
-        }
+        // 새로 추가된 부분: 마지막 ExitKind 기록
+        self.last_exit_kind = Some(exit_kind);
+
+        // 반환
+        Ok(exit_kind)
     }
 }
 
@@ -173,6 +188,21 @@ impl<S, SHM, OT> TinyInstExecutor<S, SHM, OT> {
     pub fn ignore_current_coverage(&mut self) {
         let mut _scratch: Vec<u64> = Vec::new();
         self.tinyinst.vec_coverage(&mut _scratch, true);
+    }
+
+    /// run_target 에서 저장된 마지막 crash name 을 꺼냅니다
+    pub fn take_last_crash(&mut self) -> Option<(String, bool)> {
+        self.last_crash.take()
+    }
+
+    #[allow(missing_docs)]
+    pub fn reset_last_crash(&mut self) {
+        self.last_crash = None;
+    }
+
+    /// run_target 이 마지막으로 반환한 ExitKind 를 가져옵니다.
+    pub fn last_exit_kind(&self) -> Option<ExitKind> {
+        self.last_exit_kind
     }
 }
 
@@ -387,7 +417,9 @@ where
             phantom: PhantomData,
             cur_input,
             map,
-            hit_offsets: HashSet::new(), 
+            hit_offsets: HashSet::new(),
+            last_crash: None,
+            last_exit_kind: None,
         })
     }
 }

@@ -30,6 +30,7 @@ use libafl::corpus::Corpus;
 use libafl::corpus::HasCurrentCorpusId;
 use libafl_bolts::{rands::StdRand, tuples::tuple_list};
 use libafl_tinyinst::executor::TinyInstExecutor;
+use libafl::executors::ExitKind;
 use walkdir::WalkDir;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
@@ -311,8 +312,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Suppress multi-monitor debug prints by giving an empty closure
             
             
-            //////// let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
-            let mut mgr = SimpleEventManager::new(MultiMonitor::new(|x| println!("{x}")));
+             let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
+            //////let mut mgr = SimpleEventManager::new(MultiMonitor::new(|x| println!("{x}")));
 
             let mut executor = TinyInstExecutor::builder()
                 .tinyinst_args(tinyinst_args)
@@ -361,13 +362,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut had_new_cov = false;
                     let mut had_crash = false;
                     let mut had_hang = false;
-
+                    executor.reset_last_crash();
                     for _i in 0..BATCH {
-                        let exec_before = *state.executions();
-                        let fuzz_res = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
-                        let exec_after = *state.executions();
-                        GLOBAL_EXECS.fetch_add((exec_after - exec_before) as u64, Ordering::Relaxed);
+                        
 
+                        let exec_before = *state.executions();
+                        
+                        
+                        fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
+
+                        if let Some((crash_name, is_unique)) = executor.take_last_crash() {
+                            println!("Crash name: {:?}", crash_name);
+                            had_crash = true;
+                            if is_unique {
+                                println!("Unique crash found!");
+                            }
+                            break;
+                        }
+
+ 
+                        
+                            
+                        
+
+
+                        GLOBAL_EXECS.fetch_add((*state.executions() - exec_before) as u64, Ordering::Relaxed);
 
                         let hits = executor.hit_offsets();
                         let mut newly_found = 0;
@@ -402,6 +421,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     {
+                        println!("had_new_cov = {}, had_crash = {}, had_hang = {}", had_new_cov, had_crash, had_hang);
                         let mut sh = ctx.shared.write().unwrap();
                         let s = &mut sh.stats[idx];
                         s.num_runs += BATCH as u64;
@@ -492,8 +512,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
                 let speed = execs - prev_execs;
                 smoothed_speed = ((speed as f64) * ALPHA
-                                  + (smoothed_speed as f64) (1.0 - ALPHA))
-                                  .round() as u64;
+                                  + (smoothed_speed as f64) * (1.0 - ALPHA))
+                                 .round() as u64;
                 prev_execs = execs;
 
                 let (total_samples, discarded_samples) = {

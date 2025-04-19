@@ -5,7 +5,7 @@ use std::{
     hash::{Hash, Hasher},
     path::PathBuf,
     sync::{Arc, RwLock, Mutex},
-    thread,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use clap::Parser;
@@ -67,6 +67,9 @@ static GLOBAL_SHARED_OFFSETS: Lazy<Mutex<HashSet<u64>>> = Lazy::new(|| Mutex::ne
 
 /// 한 번 잡은 코퍼스 입력에 대해 몇 번 Mutate+Execute 할지
 const BATCH: usize = 100;
+
+/// crash 횟수 임계값 (여기선 예시로 3회)
+const MAX_CRASHES: usize = 3;
 
 /// CLI 파싱용
 #[derive(Parser, Debug, Clone)]
@@ -159,14 +162,14 @@ impl SharedCorpus {
     fn requeue(&mut self, idx: usize, prio: usize) {
         if !self.discarded[idx] {
             self.queue.push((Reverse(prio), idx));
-            // dbgln!("requeue: idx={} prio={}  → queue_len={}", idx, prio, self.queue.len());
+             dbgln!("requeue: idx={} prio={}  → queue_len={}", idx, prio, self.queue.len());
         }
     }
 
     /// 해당 인덱스를 큐에서 제외
     fn discard(&mut self, idx: usize) {
         self.discarded[idx] = true;
-        // dbgln!("discard: idx={}", idx);
+         dbgln!("discard: idx={}", idx);
     }
 
     /// 반환: (총 샘플 수, discarded 된 것 수)
@@ -269,14 +272,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let fp = hasher.finish();
 
                     sh.push(BytesInput::new(data), fp);
-                    // dbgln!("로드: {} ({} bytes)", path.display(), data_len);
+                     dbgln!("로드: {} ({} bytes)", path.display(), data_len);
                 }
             }
         }
     }
-    // dbgln!("초기 SharedCorpus 큐 크기: {}", shared.read().unwrap().all.len());
+     dbgln!("초기 SharedCorpus 큐 크기: {}", shared.read().unwrap().all.len());
 
-    let mut handles = Vec::new();
+    let mut handles: Vec<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>> = Vec::new();
     for thread_id in 0..num_threads {
         let shared       = shared.clone();
         let tinyinst_args = tinyinst_args.clone();
@@ -286,7 +289,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let corpus_path  = corpus_path.clone();
         let crashes_path = crashes_path.clone();
 
-        handles.push(thread::spawn(move || {
+        handles.push(thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // thread::sleep(Duration::from_secs((thread_id + 1) as u64));
 
             let mut coverage_map = vec![0u64; MAP_SIZE];
@@ -323,9 +326,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .coverage_ptr(cov_ptr)
                 .build(tuple_list!(map_observer, time_observer)).unwrap();
 
-            state
-                .load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_path.clone()])
-                .expect("Failed to load initial inputs");
+            match state.load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_path.clone()]) {
+                Ok(_) => {}
+                Err(err) => {
+                    // executor.take_last_crash() 에 "Duplicate crash" 정보가 들어있다면
+                    if let Some((crash_name, _is_unique, crash_count)) = executor.take_last_crash() {
+                        eprintln!(
+                            "[ViFuzz] 초기 로딩 중 중복 크래시 {:?} (count={}), 건너뜁니다",
+                            crash_name, crash_count
+                        );
+                    } else {
+                        // 기타 에러는 그대로 상위로 올려서 페닉
+                        return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                    }
+                }
+            }
 
             let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5).unwrap();
             let mut stages = tuple_list!(StdMutationalStage::new(mopt));
@@ -362,29 +377,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut had_new_cov = false;
                     let mut had_crash = false;
                     let mut had_hang = false;
-                    executor.reset_last_crash();
                     for _i in 0..BATCH {
-                        
+                        executor.reset_last_crash();
 
                         let exec_before = *state.executions();
-                        
-                        
-                        fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
+                        // fuzz_one가 Err(“Duplicate crash…”)을 던질 수 있으므로 Result로 받습니다.
+                        let fuzz_res = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
+                        if let Err(err) = fuzz_res {
+                            // executor에 기록된 마지막 crash 정보를 꺼내 보고
+                            if let Some((crash_name, _is_unique, crash_count)) = executor.take_last_crash() {
+                                eprintln!("[ViFuzz] Duplicate crash {:?} (count={}), discarding sample {}", crash_name, crash_count, idx);
+                                let mut sh = ctx.shared.write().unwrap();
+                                sh.discard(idx);
+                                // 이 샘플은 더 돌리지 않도록 루프 탈출
+                                break;
+                            } else {
+                                // 그 외 에러는 그대로 올려보냅니다.
+                                return Err(Box::new(err) as Box<dyn std::error::Error + Send + Sync>);
+                            }
+                        }
 
-                        if let Some((crash_name, is_unique)) = executor.take_last_crash() {
-                            println!("Crash name: {:?}", crash_name);
+                        // 정상 복귀한 경우에도 crash가 찍혔을 수 있으니 기존 로직 유지
+                        if let Some((crash_name, is_unique, crash_count)) = executor.take_last_crash() {
+                            println!("Crash name: {:?}, total count = {}", crash_name, crash_count);
                             had_crash = true;
-                            if is_unique {
-                                println!("Unique crash found!");
+                            if is_unique || crash_count > MAX_CRASHES {
+                                println!("[ViFuzz] Discarding sample {} after crash", idx);
+                                let mut sh = ctx.shared.write().unwrap();
+                                sh.discard(idx);
                             }
                             break;
                         }
-
- 
-                        
-                            
-                        
-
 
                         GLOBAL_EXECS.fetch_add((*state.executions() - exec_before) as u64, Ordering::Relaxed);
 
@@ -420,49 +443,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    {
-                        println!("had_new_cov = {}, had_crash = {}, had_hang = {}", had_new_cov, had_crash, had_hang);
-                        let mut sh = ctx.shared.write().unwrap();
-                        let s = &mut sh.stats[idx];
-                        s.num_runs += BATCH as u64;
-                        if had_crash {
-                            s.num_crashes += 1;
-                        }
-                        if had_hang {
-                            s.num_hangs += 1;
-                        }
-
-                        // crash 또는 hang 이 발생했으면 저장/로깅 후 폐기
-                        if s.num_crashes > 0 || s.num_hangs > 0 {
-                            // 1) 로깅
-                            println!(
-                                "[ViFuzz] Discarding sample {} (runs {}, crashes {}, hangs {})",
-                                idx, s.num_runs, s.num_crashes, s.num_hangs
-                            );
-                            // 2) crash 이면 파일로 저장
-                            if had_crash {
-                                let crash_file =
-                                    crashes_path.join(format!("crash_{}_{}.bin", thread_id, idx));
-                                let bytes = ctx.local[idx].as_ref();
-                                if let Err(e) = fs::write(&crash_file, bytes) {
-                                    eprintln!(
-                                        "[ViFuzz] Failed to save crash file {}: {}",
-                                        crash_file.display(),
-                                        e
-                                    );
-                                }
-                            }
-                            sh.discard(idx);
-                        } else {
-                            // 정상 입력이면 우선순위 재조정
-                            if had_new_cov {
-                                s.num_newcov += 1;
-                            }
-                            let prio = if had_new_cov { 0 } else { 3 };
-                            sh.requeue(idx, prio);
-                        }
-                    }
-
                     let after = state.corpus().count();
                     if after > 0 {
                         let new_id = after - 1;
@@ -481,32 +461,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 let mut sh = ctx.shared.write().unwrap();
                                 sh.push(BytesInput::new(bytes_vec.clone()), sample_fp);
-// let (tot, disc) = sh.stats();
-                                // dbgln!(
-                                //     "[Thread {}] ▶ shared.push() – new total {}, discarded {}",
-                                //     thread_id,
-                                //     tot,
-                                //     disc
-                                // );
+                                let (tot, disc) = sh.stats();
+                                 dbgln!(
+                                     "[Thread {}] ▶ shared.push() – new total {}, discarded {}",
+                                     thread_id,
+                                     tot,
+                                     disc
+                                 );
                             }
                         }
                     }
                 } else {
 // Comment out this debug message
-                    // println!("Thread {}: no jobs left, sleeping...", thread_id);
+                    println!("Thread {}: no jobs left, sleeping...", thread_id);
                     thread::sleep(Duration::from_millis(100));
                 }
             }
+            Ok(())
         }));
     }
 
-    {
+    // Spawn stats reporter so that we see logs every second
+    let stats_handle = {
         let shared_stats = shared.clone();
-        let mut prev_execs = 0u64;
-        let mut smoothed_speed: u64 = 0;
-        const ALPHA: f64 = 0.2;   // exponential smoothing factor
-
         thread::spawn(move || {
+            let mut prev_execs = 0u64;
+            let mut smoothed_speed = 0u64;
+            const ALPHA: f64 = 0.2;
             loop {
                 thread::sleep(Duration::from_secs(1));
                 let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
@@ -520,18 +501,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let sh = shared_stats.read().unwrap();
                     sh.stats()
                 };
-
-                let cov_cnt = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
                 let offsets_set_size = {
                     let set = GLOBAL_SHARED_OFFSETS.lock().unwrap();
                     set.len()
                 };
 
-                // **유일하게 남긴 출력 (STATS)**
                 println!(
                     "[ViFuzz] STATS: coverage {:>8}, \
-                     samples {:>6} (discarded {:>6}), exec/s {:>10} (avg {:>10}), total_execs {:>12}",
-                    
+                     samples {:>6} (discarded {:>6}), \
+                     exec/s {:>10} (avg {:>10}), \
+                     total_execs {:>12}",
                     offsets_set_size,
                     total_samples,
                     discarded_samples,
@@ -540,12 +519,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     execs
                 );
             }
-        });
+        })
+    };
+
+    // 이제 fuzz 스레드들을 join 해서 메인 스레드가 종료되지 않게 막습니다.
+    for handle in handles {
+        let thr_res = handle.join()
+            .map_err(|e| format!("thread panicked: {:?}", e))?;
+        thr_res;
     }
 
-    for h in handles {
-        let _ = h.join();
-    }
-
+    // (원한다면) stats thread 도 join 해 줄 수 있지만, 무한루프라서 생략하거나
+    // stats_handle.join().unwrap();
     Ok(())
 }

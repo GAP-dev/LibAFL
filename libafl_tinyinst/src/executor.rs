@@ -36,7 +36,7 @@ pub struct TinyInstExecutor<S, SHM, OT> {
     cur_input: InputFile,
     map: Option<SHM>,
     hit_offsets: HashSet<u64>,
-    last_crash: Option<(String, bool)>,  // (crash_name, is_unique)
+    last_crash: Option<(String, bool, usize)>, // (crash_name, is_unique, count)
     last_exit_kind: Option<ExitKind>,
 }
 
@@ -123,18 +123,22 @@ where
             // 없다면 C++ side bridge에 GetCrashName() 추가 후 가져와야 함.
             if let Some(crash_name) = unsafe { self.tinyinst.get_crash_name() } {
                 let mut map = UNIQUE_CRASHES.lock().unwrap();
-                let count = map.entry(crash_name.clone()).or_insert(0);
-                *count += 1;
-                let is_unique = *count == 1;
-                // main 에 전달하기 위해 저장
-                self.last_crash = Some((crash_name.clone(), is_unique));
+                let cnt = map.entry(crash_name.clone()).or_insert(0);
+                *cnt += 1;
+                let is_unique = *cnt == 1;
+                let current_count = *cnt;
+                self.last_crash = Some((crash_name.clone(), is_unique, current_count));
                 if is_unique {
                     // 유니크 크래시: 첫 발견
                     // TODO: crash corpus에 저장, 로깅 등
                     eprintln!("[*] New unique crash: {crash_name}");
                 } else {
                     // 중복 크래시
-                    eprintln!("[*] Duplicate crash: {crash_name} (count={})", *count);
+                    eprintln!("[*] Duplicate crash: {crash_name} (count={})", *cnt);
+                    return Err(Error::unknown(
+                        format!("Duplicate crash: {crash_name} (count={})", *cnt),
+                    ));
+                    
                 }
             }
         }
@@ -191,13 +195,14 @@ impl<S, SHM, OT> TinyInstExecutor<S, SHM, OT> {
     }
 
     /// run_target 에서 저장된 마지막 crash name 을 꺼냅니다
-    pub fn take_last_crash(&mut self) -> Option<(String, bool)> {
+    pub fn take_last_crash(&mut self) -> Option<(String, bool, usize)> {
         self.last_crash.take()
     }
 
     #[allow(missing_docs)]
     pub fn reset_last_crash(&mut self) {
         self.last_crash = None;
+      
     }
 
     /// run_target 이 마지막으로 반환한 ExitKind 를 가져옵니다.

@@ -208,14 +208,14 @@ impl ThreadContext {
         let idx_opt = {
             let mut sh = self.shared.write().unwrap();
             let idx = sh.pop_job();
-            // let (total, disc) = sh.stats();
-            // dbgln!(
-            //     "Thread {} sync: SharedCorpus stats – total {}, discarded {}, queue {}",
-            //     self.id,
-            //     total,
-            //     disc,
-            //     sh.queue.len()
-            // );
+             let (total, disc) = sh.stats();
+             dbgln!(
+                 "Thread {} sync: SharedCorpus stats – total {}, discarded {}, queue {}",
+                 self.id,
+                 total,
+                 disc,
+                 sh.queue.len()
+             );
             idx
         };
 
@@ -314,7 +314,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut executor = TinyInstExecutor::builder()
                 .tinyinst_args(tinyinst_args)
                 .program_args(target_args)
-                .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 10000)
+                .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 1000000)
                 .timeout(Duration::from_millis(timeout))
                 .coverage_ptr(cov_ptr)
                 .build(tuple_list!(map_observer, time_observer)).unwrap();
@@ -373,10 +373,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for _i in 0..BATCH {
                         let exec_before = *state.executions();
 
-                        if let Err(_e) = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr) {
-                            // Commenting out error print
-                            // eprintln!("Error during fuzzing: {:?}", e);
-                            break;
+                        if let Err(e) = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr) {
+                            eprintln!("Error during fuzzing: {:?}", e);
                         }
                         let exec_after = *state.executions();
                         GLOBAL_EXECS.fetch_add((exec_after - exec_before) as u64, Ordering::Relaxed);

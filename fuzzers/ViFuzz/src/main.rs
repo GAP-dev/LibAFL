@@ -388,7 +388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if let Some((crash_name, _is_unique, crash_count)) = executor.take_last_crash() {
                                 eprintln!("[ViFuzz] Duplicate crash {:?} (count={}), discarding sample {}", crash_name, crash_count, idx);
                                 let mut sh = ctx.shared.write().unwrap();
-                                sh.discard(idx);
+                                ////////// sh.discard(idx);
                                 // 이 샘플은 더 돌리지 않도록 루프 탈출
                                 break;
                             } else {

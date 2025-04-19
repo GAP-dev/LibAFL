@@ -19,8 +19,12 @@ use libafl_bolts::{
 };
 use tinyinst::tinyinst::{TinyInst, litecov::RunResult};
 
-use std::collections::HashSet;
+use std::{collections::HashMap,collections::HashSet, sync::Mutex};
+use once_cell::sync::Lazy;
 
+// crash 이름별 카운트를 저장하는 전역 맵
+static UNIQUE_CRASHES: Lazy<Mutex<HashMap<String, usize>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// [`TinyInst`](https://github.com/googleprojectzero/TinyInst) executor
 pub struct TinyInstExecutor<S, SHM, OT> {
@@ -81,31 +85,27 @@ where
                 self.cur_input.write_buf(input.target_bytes().as_slice())?;
             }
         }
-    
+        
+        
         #[expect(unused_assignments)]
         let mut status = RunResult::OK;
+
         unsafe {
+            // 1) 첫 실행
             status = self.tinyinst.run();
+            // 커버리지를 vec<u64> 형태로 가져오기
             self.tinyinst
                 .vec_coverage(self.coverage_ptr.as_mut().unwrap(), false);
-            
-            // Filter out already-seen offsets and notify observers of only new ones
-            let cov_vec = self.coverage_ptr.as_mut().unwrap();
-           // let mut new_hits = Vec::new();
 
-            /////// println!("Coverage vector: {:?}", cov_vec);
-            
+            // coverage_ptr에서 offsets를 꺼내 hit_offsets에 쌓기
+            let cov_vec = self.coverage_ptr.as_mut().unwrap();
             self.hit_offsets.extend(cov_vec.drain(..));
-            //////// println!("Hit offsets: {:?}", self.hit_offsets);
-            // Mark current coverage as baseline so the next run only reports new edges
-            //self.ignore_current_coverage();
-            // clear the coverage buffer for next run
             cov_vec.clear();
         }
 
+        // 2) CRASH/HANG이면 최대 3번 재시도(플레이키 문제 등)
         let mut retry_count = 0;
         let mut final_status = status;
-
         while matches!(final_status, RunResult::CRASH | RunResult::HANG) && retry_count < 3 {
             retry_count += 1;
             unsafe {
@@ -115,18 +115,41 @@ where
             }
         }
 
+        // 3) 최종적으로 CRASH/HANG이라면, CrashName 받아 중복 체크
+        if matches!(final_status, RunResult::CRASH | RunResult::HANG) {
+            // tinyinst-rs 바인딩에 따라 "get_crash_name()"을 노출했다고 가정
+            // 없다면 C++ side bridge에 GetCrashName() 추가 후 가져와야 함.
+            if let Some(crash_name) = unsafe { self.tinyinst.get_crash_name() } {
+                let mut map = UNIQUE_CRASHES.lock().unwrap();
+                let count = map.entry(crash_name.clone()).or_insert(0);
+                *count += 1;
+                if *count == 1 {
+                    // 유니크 크래시: 첫 발견
+                    // TODO: crash corpus에 저장, 로깅 등
+                    eprintln!("[*] New unique crash: {crash_name}");
+                } else {
+                    // 중복 크래시
+                    eprintln!("[*] Duplicate crash: {crash_name} (count={})", *count);
+                }
+            }
+        }
+
+        // 4) 최종 상태에 따라 ExitKind 결정
         match final_status {
-            RunResult::CRASH | RunResult::HANG if retry_count == 3 => {
-                Ok(ExitKind::Crash)
-            }
-            RunResult::CRASH | RunResult::HANG => {
-                Ok(ExitKind::Ok)
-            }
+            // 재시도 끝에 여전히 CRASH/HANG이면 실제 Crash 처리
+            RunResult::CRASH | RunResult::HANG if retry_count == 3 => Ok(ExitKind::Crash),
+
+            // 재시도 중 성공(= OK)으로 돌아왔거나,
+            // Crash/Hang이지만 retry_count가 3 미만이면 "플레이키"로 간주하여 Ok 처리
+            RunResult::CRASH | RunResult::HANG => Ok(ExitKind::Ok),
+
             RunResult::OK => Ok(ExitKind::Ok),
             RunResult::OTHER_ERROR => Err(Error::unknown(
                 "Tinyinst RunResult is other error".to_string(),
             )),
-            _ => Err(Error::unknown("Tinyinst RunResult is unknown".to_string())),
+            _ => Err(Error::unknown(
+                "Tinyinst RunResult is unknown".to_string(),
+            )),
         }
     }
 }

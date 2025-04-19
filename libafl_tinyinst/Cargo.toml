@@ -33,6 +33,7 @@ libafl_bolts = { workspace = true, default-features = true, features = [
 #tinyinst = { git = "https://github.com/GAP-dev/tinyinst-rs" }
 tinyinst = { path = "../tinyinst-rs" }
 log = { workspace = true }
+once_cell = "1.17"
 
 [build-dependencies]
 cmake = { workspace = true }

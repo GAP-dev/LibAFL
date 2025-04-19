@@ -309,7 +309,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let scheduler = QueueScheduler::new();
             let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
             // Suppress multi-monitor debug prints by giving an empty closure
-            let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
+            
+            
+            //////// let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
+            let mut mgr = SimpleEventManager::new(MultiMonitor::new(|x| println!("{x}")));
 
             let mut executor = TinyInstExecutor::builder()
                 .tinyinst_args(tinyinst_args)
@@ -355,29 +358,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     state.set_corpus_id(corpus_id).unwrap();
 
-                    // let mut dbg_hasher = AHasher::default();
-                    // ctx.local[idx].as_ref().hash(&mut dbg_hasher);
-                    // let input_fp = dbg_hasher.finish();
-                    // let input_len = ctx.local[idx].as_ref().len();
-
-                    // dbgln!(
-                    //     "[Thread {}] Fuzzing idx {} (len {:>6}, hash {:#016x})  ─ corpus_id = {:?}",
-                    //     thread_id,
-                    //     idx,
-                    //     input_len,
-                    //     input_fp,
-                    //     corpus_id
-                    // );
-
                     let mut had_new_cov = false;
+                    let mut had_crash = false;
+                    let mut had_hang = false;
+
                     for _i in 0..BATCH {
                         let exec_before = *state.executions();
-
-                        if let Err(e) = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr) {
-                            eprintln!("Error during fuzzing: {:?}", e);
-                        }
+                        let fuzz_res = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
                         let exec_after = *state.executions();
                         GLOBAL_EXECS.fetch_add((exec_after - exec_before) as u64, Ordering::Relaxed);
+
 
                         let hits = executor.hit_offsets();
                         let mut newly_found = 0;
@@ -415,11 +405,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let mut sh = ctx.shared.write().unwrap();
                         let s = &mut sh.stats[idx];
                         s.num_runs += BATCH as u64;
-                        if had_new_cov {
-                            s.num_newcov += 1;
+                        if had_crash {
+                            s.num_crashes += 1;
                         }
-                        let prio = if had_new_cov { 0 } else { 3 };
-                        sh.requeue(idx, prio);
+                        if had_hang {
+                            s.num_hangs += 1;
+                        }
+
+                        // crash 또는 hang 이 발생했으면 저장/로깅 후 폐기
+                        if s.num_crashes > 0 || s.num_hangs > 0 {
+                            // 1) 로깅
+                            println!(
+                                "[ViFuzz] Discarding sample {} (runs {}, crashes {}, hangs {})",
+                                idx, s.num_runs, s.num_crashes, s.num_hangs
+                            );
+                            // 2) crash 이면 파일로 저장
+                            if had_crash {
+                                let crash_file =
+                                    crashes_path.join(format!("crash_{}_{}.bin", thread_id, idx));
+                                let bytes = ctx.local[idx].as_ref();
+                                if let Err(e) = fs::write(&crash_file, bytes) {
+                                    eprintln!(
+                                        "[ViFuzz] Failed to save crash file {}: {}",
+                                        crash_file.display(),
+                                        e
+                                    );
+                                }
+                            }
+                            sh.discard(idx);
+                        } else {
+                            // 정상 입력이면 우선순위 재조정
+                            if had_new_cov {
+                                s.num_newcov += 1;
+                            }
+                            let prio = if had_new_cov { 0 } else { 3 };
+                            sh.requeue(idx, prio);
+                        }
                     }
 
                     let after = state.corpus().count();
@@ -440,7 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             {
                                 let mut sh = ctx.shared.write().unwrap();
                                 sh.push(BytesInput::new(bytes_vec.clone()), sample_fp);
-                                // let (tot, disc) = sh.stats();
+// let (tot, disc) = sh.stats();
                                 // dbgln!(
                                 //     "[Thread {}] ▶ shared.push() – new total {}, discarded {}",
                                 //     thread_id,
@@ -451,7 +472,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 } else {
-                    // Comment out this debug message
+// Comment out this debug message
                     // println!("Thread {}: no jobs left, sleeping...", thread_id);
                     thread::sleep(Duration::from_millis(100));
                 }
@@ -471,7 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
                 let speed = execs - prev_execs;
                 smoothed_speed = ((speed as f64) * ALPHA
-                                  + (smoothed_speed as f64) * (1.0 - ALPHA))
+                                  + (smoothed_speed as f64) (1.0 - ALPHA))
                                   .round() as u64;
                 prev_execs = execs;
 

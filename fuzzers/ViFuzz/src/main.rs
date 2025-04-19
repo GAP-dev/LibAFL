@@ -34,6 +34,9 @@ use libafl::executors::ExitKind;
 use walkdir::WalkDir;
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use once_cell::sync::Lazy;
+use rand::seq::SliceRandom;
+use rand::thread_rng;
+use rand::prelude::IndexedRandom;
 
 /// simple conditional debug print (now unused)
 macro_rules! dbgln {
@@ -150,13 +153,29 @@ impl SharedCorpus {
 
     /// 작업 인덱스 하나 꺼내기
     fn pop_job(&mut self) -> Option<usize> {
+        // 1) 우선순위 큐에서 하나 꺼내 보기
         while let Some((_, idx)) = self.queue.pop() {
             if !self.discarded[idx] {
                 return Some(idx);
             }
         }
-        None
+
+        // 2) 여기까지 왔다는 것은 우선순위 큐에 실제로 사용할 게 없음
+        //    그럼 discarded 안 된 샘플 중에서 아무거나 고르자(랜덤 fallback)
+        let valid_indices: Vec<usize> = self.all
+            .iter()
+            .enumerate()
+            .filter_map(|(i, _)| if !self.discarded[i] { Some(i) } else { None })
+            .collect();
+
+        if valid_indices.is_empty() {
+            return None;
+        }
+
+        let mut rng = thread_rng();
+        Some(*valid_indices.choose(&mut rng).unwrap())
     }
+
 
     /// 작업 완료 후 재큐 (priority 낮추면 뒤로 밀림)
     fn requeue(&mut self, idx: usize, prio: usize) {

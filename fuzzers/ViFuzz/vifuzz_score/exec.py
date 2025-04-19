@@ -24,12 +24,15 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
     cmd = [binary] + options + ["--"] + target_args
     print("Executing:", " ".join(cmd))
     
-    # 패턴 1: Iteration 로그 (Crashes 추가)
+    # 패턴 1: Iteration 로그 (예: "Pid: 12345, Tid: ...| Iteration 100 - Coverage count: 200 | Corpus entries: 300 | Crashes: 0")
     pattern_iteration = re.compile(
         r"Pid:\s*(\d+),\s*Tid:[^|]+\|\s*Iteration\s+(\d+)\s*-\s*Coverage count:\s+(\d+)\s*\|\s*Corpus entries:\s+(\d+)\s*\|\s*Crashes:\s+(\d+)"
     )
     
-    # 패턴 2: [ViFuzz] STATS: coverage 0, samples 174 (discarded 0), exec/s 0 (avg 0), total_execs 0
+    # 패턴 2: [ViFuzz] STATS: 로그
+    # 예: [ViFuzz] STATS: coverage    14727, samples    216 (discarded      0), exec/s       1020 (avg       1514), total_execs       436524
+    #
+    # 필요에 따라 \s* 대신 \s+ 등으로 변경하여 여러 공백도 매치하도록 조정할 수 있습니다.
     pattern_stats = re.compile(
         r"\[ViFuzz\]\s*STATS:\s*coverage\s*(\d+),\s*samples\s*(\d+)\s*\(discarded\s*(\d+)\),\s*exec/s\s*(\d+)\s*\(avg\s*(\d+)\),\s*total_execs\s*(\d+)"
     )
@@ -38,7 +41,7 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
     
     # 프로그램 시작 시각 기록
     start_time = time.time()
-    results = []  # 파싱된 결과 저장 리스트 (CSV로 저장할 예정)
+    results = []  # 파싱된 결과를 저장할 리스트 (이후 CSV로 저장)
     
     try:
         while True:
@@ -73,7 +76,7 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
                     corpus_entries = match_iter.group(4)
                     crashes        = match_iter.group(5)
                     
-                    # 파싱된 결과를 리스트에 저장
+                    # 파싱된 결과 리스트에 저장
                     results.append({
                         "Elapsed Time": elapsed_str,
                         "Pid": pid,
@@ -81,7 +84,7 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
                         "Coverage Count": coverage_count,
                         "Corpus Entries": corpus_entries,
                         "Crashes": crashes,
-                        # 아직 STATS 필드는 없으므로 빈값으로 채우기
+                        # 아직 STATS 필드는 없으므로 빈 값으로 채우기
                         "Stats Coverage": "",
                         "Samples": "",
                         "Discarded": "",
@@ -120,19 +123,21 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
                     })
                     
                     # 콘솔에 표시
-                    print(f"[{elapsed_str}][ViFuzz STATS] coverage: {stats_coverage}, samples: {samples}, discarded: {discarded}, exec/s: {exec_s} (avg: {avg_exec_s}), total_execs: {total_execs}")
+                    print(f"[{elapsed_str}][ViFuzz STATS] coverage: {stats_coverage}, samples: {samples}, discarded: {discarded}, "
+                          f"exec/s: {exec_s} (avg: {avg_exec_s}), total_execs: {total_execs}")
                     
     except KeyboardInterrupt:
         print("사용자에 의해 종료되었습니다.")
     finally:
-        # stderr 출력 (필요할 경우)
+        # stderr 출력
         err = process.stderr.read()
         if err:
             sys.stderr.write(err)
+        
         retcode = process.wait()
         print("프로세스 종료 코드:", retcode)
         
-        # CSV 파일 저장
+        # CSV 파일로 저장
         csv_filename = "results.csv"
         with open(csv_filename, mode="w", newline="") as csvfile:
             fieldnames = [
@@ -156,6 +161,5 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
         print(f"결과가 CSV 파일({csv_filename})에 저장되었습니다.")
 
 if __name__ == "__main__":
-    # show_raw_output 매개변수를 False로 설정하면
-    # 파싱된 결과만 최소한으로 콘솔에 표시됩니다.
+    # show_raw_output를 True로 설정하면 원본 로그를 그대로 콘솔에 표시합니다.
     run_rust_fuzzer(show_raw_output=True)

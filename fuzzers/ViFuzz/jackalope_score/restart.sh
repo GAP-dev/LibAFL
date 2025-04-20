@@ -1,7 +1,4 @@
-#/bin/sh
-rm -rf ./corpus_discovered
-rm -rf ./crashes
-mkdir ./crashes
-mkdir ./corpus_discovered
-#cp ./test/* ./corpus_discovered/
-find ./test/ -type f -exec cp {} ./corpus_discovered/ \; 
+sudo rm -rf corpus_discovered 
+sudo rm -rf crashes 
+sudo cp -r ../main/corpus corpus_discovered
+sudo mkdir crashes

@@ -4,7 +4,7 @@ import re
 import time  # 경과 시간 측정을 위한 모듈
 import csv
 
-def run_jackalope_fuzzer(show_raw_output=False, run_duration=600):
+def run_jackalope_fuzzer(show_raw_output=False, run_duration=1800):
     # Jackalope 퍼저 실행 파일 (빌드된 바이너리 경로)
     binary = "/Users/gap_dev/fuzz_jack/Jackalope/build/Release/fuzzer"
     

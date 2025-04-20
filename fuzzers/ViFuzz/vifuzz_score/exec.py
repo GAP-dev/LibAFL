@@ -4,7 +4,7 @@ import re
 import time  # 경과 시간 측정을 위한 모듈
 import csv
 
-def run_rust_fuzzer(show_raw_output=False, run_duration=600):
+def run_rust_fuzzer(show_raw_output=False, run_duration=1800):
     # Rust fuzzer 실행 파일 이름 (빌드된 바이너리 경로)
     binary = "../target/debug/ViFuzz"
     
@@ -14,7 +14,7 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=600):
         "--corpus-path", "./corpus_discovered",
         "--crashes-path", "./crashes",
         "--forks", "10",
-        "--fuzz-iterations", "10000000000",
+        "--fuzz-iterations", "1000000000000000000",
     ]
     
     # 타깃 인자: 옵션 이후의 위치 인자로 전달합니다.

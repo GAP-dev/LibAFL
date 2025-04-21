@@ -3,6 +3,7 @@ target-bin
 out
 Cargo.lock
 vendor
+corpus
 
 .DS_Store
 .env

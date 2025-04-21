@@ -18,7 +18,7 @@ use libafl::{
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
     inputs::BytesInput,
     monitors::MultiMonitor,
-    mutators::{StdMOptMutator, havoc_mutations},
+    mutators::{havoc_mutations, StdScheduledMutator},
     observers::{StdMapObserver, TimeObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
@@ -86,12 +86,11 @@ static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_UNIQUE_OFFSETS: AtomicUsize = AtomicUsize::new(0);
 
 /// **전역으로 공유할 오프셋 Set** (디버깅+중복 여부 체크)
-static GLOBAL_SHARED_OFFSETS: Lazy<Mutex<HashSet<u64>>> = Lazy::new(|| Mutex::new(HashSet::new()));
+static GLOBAL_SHARED_OFFSETS: once_cell::sync::Lazy<Mutex<HashSet<u64>>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashSet::new()));
 
 /// Maximum unique coverage offsets so far
 static GLOBAL_MAX_THREAD_COV: AtomicUsize = AtomicUsize::new(0);
-
-use once_cell::sync::Lazy;
 
 /// (Optional) 입력 통계
 #[derive(Default, Clone)]
@@ -291,8 +290,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // pre-load corpus
             let _ = state.load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir.clone()]);
 
-            let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5)?;
-            let mut stages = tuple_list!(StdMutationalStage::new(mopt));
+            // ---- Havoc-only mutator (no MOpt) ----
+            let havoc_mutator = StdScheduledMutator::new(havoc_mutations());
+            let mut stages = tuple_list!(StdMutationalStage::new(havoc_mutator));
 
             let mut ctx = ThreadContext::new(thread_id, shared);
             loop {

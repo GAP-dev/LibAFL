@@ -42,7 +42,7 @@ const MAP_SIZE: usize = 65536;
 const MAP_BYTES: usize = MAP_SIZE * 8;
 
 /// 한 번 잡은 코퍼스 입력에 대해 몇 번 Mutate+Execute 할지
-const BATCH: usize = 100;
+const BATCH: usize = 1000;
 
 /// crash 횟수 임계값
 const MAX_CRASHES: usize = 3;

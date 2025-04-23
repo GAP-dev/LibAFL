@@ -1,24 +1,28 @@
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex,
+        Mutex,
     },
+    time::{Duration, Instant},
     thread,
-    time::Duration,
 };
-use rand::thread_rng;
+
 use clap::Parser;
 use once_cell::sync::Lazy;
 use walkdir::WalkDir;
+
+// rand
+use rand::prelude::*;
+use rand::thread_rng;
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
+
+// libafl + bolts
 use libafl_bolts::{rands::StdRand, tuples::tuple_list};
 use libafl::{
-    
-    corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
+    corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus},
     events::SimpleEventManager,
     feedback_or_fast,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
@@ -33,16 +37,16 @@ use libafl::{
 };
 use libafl_tinyinst::executor::TinyInstExecutor;
 
-/// TinyInst 커버리지 맵 크기 (u64 단위)
+/// Coverage map size
 const MAP_SIZE: usize = 65536;
-/// 바이트로 계산할 때
-const MAP_BYTES: usize = MAP_SIZE * 8;
 
-/// 커버리지 보고를 위해 전역으로 보관
+/// 전역 실행 횟수
 static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
+
+/// coverage offset의 총 개수
 static GLOBAL_UNIQUE_OFFSETS: AtomicUsize = AtomicUsize::new(0);
 
-/// 전역 Set으로 새 오프셋 기록
+/// 실제 coverage offset들을 보관
 static GLOBAL_SHARED_OFFSETS: Lazy<Mutex<ahash::HashSet<u64>>> =
     Lazy::new(|| Mutex::new(ahash::HashSet::default()));
 
@@ -52,25 +56,23 @@ static GLOBAL_MAX_THREAD_COV: AtomicUsize = AtomicUsize::new(0);
 /// crash 횟수 제한
 const MAX_CRASHES: usize = 3;
 
-/// 각 스레드가 수행할 배치 (한 번 corpus 아이템 골랐을 때 몇 번 변이+실행)
+/// 한 시드에 대해 변이+실행 반복 횟수
 const BATCH: usize = 10;
 
+/// 스레드 간 시드 공유 주기(초)
+const SYNC_INTERVAL: u64 = 5;
+
 #[derive(Parser, Debug, Clone)]
-#[clap(author, version, about)]
 struct Config {
-    /// 전체 corpus 경로
-    #[clap(long, value_parser, default_value = "./corpus")]
+    #[clap(long, default_value = "./corpus")]
     corpus_path: PathBuf,
 
-    /// (Optional) Crash 아웃풋(전역) 저장 경로
-    #[clap(long, value_parser, default_value = "./crashes_all")]
+    #[clap(long, default_value = "./crashes_all")]
     crashes_path: PathBuf,
 
-    /// 스레드(= 파티션) 개수
     #[clap(long, default_value_t = 4)]
     forks: usize,
 
-    /// timeout(ms)
     #[clap(long, default_value_t = 2000)]
     timeout: u64,
 
@@ -80,127 +82,122 @@ struct Config {
     #[clap(long)]
     tinyinst_extra: Option<String>,
 
-    /// 타겟 실행 파일
-    #[clap(long, value_parser, default_value = "./target_app")]
+    #[clap(long, default_value = "./target_app")]
     target: PathBuf,
 
-    /// 타겟에 넘길 인자
     #[clap(last = true)]
     target_args: Vec<String>,
 }
 
-/// worker 스레드 함수 파라미터
 #[derive(Clone)]
 struct ThreadParam {
     thread_id: usize,
-    corpus_dir: PathBuf,  // 이 스레드만의 corpus 폴더
-    crashes_dir: PathBuf, // 이 스레드만의 crashes 폴더
+    corpus_dir: PathBuf,
+    crashes_dir: PathBuf,
+    shared_unique_dir: PathBuf,
     tinyinst_args: Vec<String>,
     target_args: Vec<String>,
     timeout: u64,
 }
 
-/// worker 스레드 메인
+/// (A) 에러 반환 타입을 `Result<..., Box<dyn Error + Send + Sync>>`로:
 fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ThreadParam {
         thread_id,
         corpus_dir,
         crashes_dir,
+        shared_unique_dir,
         tinyinst_args,
         target_args,
         timeout,
     } = param;
 
-    // (1) 커버리지 맵, Observers
+    // Observers
     let mut coverage_map = vec![0u64; MAP_SIZE];
     let cov_ptr: *mut Vec<u64> = &mut coverage_map as *mut Vec<u64>;
-    // unsafe지만 실제 lifetime 맞춰서 사용
     let map_observer = unsafe { StdMapObserver::new("tinyinst_map", &mut coverage_map) };
     let time_observer = TimeObserver::new("time_observer");
 
-    // (2) Feedback, Objective
+    // Feedback
     let map_feedback = MaxMapFeedback::new(&map_observer);
     let mut feedback = feedback_or_fast!(map_feedback, TimeFeedback::new(&time_observer));
     let mut objective = CrashFeedback::new();
 
-    // (3) State
+    // Random
     let rand = StdRand::with_seed(thread_id as u64 + 12345);
-    let mut state = StdState::new(
-        rand,
-        // 이 스레드 전용 corpus 폴더
-        InMemoryOnDiskCorpus::<BytesInput>::new(corpus_dir.clone())?,
-        // 이 스레드 전용 crash 폴더
-        OnDiskCorpus::<BytesInput>::new(crashes_dir.clone())?,
-        &mut feedback,
-        &mut objective,
-    )?;
 
-    // (4) Fuzzer
+    // (B) 수동 변환: `?`를 쓰려면 `Result<..., libafl_bolts::Error>` → `Box<dyn Error + Send+Sync>`
+    //     매번 `.map_err(|e| e.into())?`로 변환하거나, 아래처럼 `Box::new(e)`로 래핑:
+    let inmem = InMemoryOnDiskCorpus::<BytesInput>::new(corpus_dir.clone())
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let ondisk = OnDiskCorpus::<BytesInput>::new(crashes_dir.clone())
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    let mut state = StdState::new(rand, inmem, ondisk, &mut feedback, &mut objective)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+    // Fuzzer
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
-
-    // (5) Event manager
     let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
 
-    // (6) TinyInstExecutor (Persistent 모드 예시)
+    // TinyInstExecutor
     let mut executor = TinyInstExecutor::builder()
         .tinyinst_args(tinyinst_args)
         .program_args(target_args)
         .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 1_000_000)
         .timeout(Duration::from_millis(timeout))
         .coverage_ptr(cov_ptr)
-        .build(tuple_list!(map_observer, time_observer))?;
+        .build(tuple_list!(map_observer, time_observer))
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    // (7) corpus load
-    let _ = state.load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir]);
+    // 로컬 corpus load
+    state
+        .load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir.clone()])
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    // (8) Mutator
-    let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5)?;
+    // Mutator
+    let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
     let mut stages = tuple_list!(StdMutationalStage::new(mopt));
 
-    // (9) fuzz loop
-    loop {
-        // 스케줄러가 pick할 아이템(로컬 corpus에서)
-        // 한 아이템에 대해 BATCH번 변이+실행
-        // libafl의 fuzz_one()은 자동으로 state.corpus().current()를 고릅니다
-        // QueueScheduler는 round-robin 등등
+    let mut last_sync = Instant::now();
 
+    loop {
         let exec_before = *state.executions();
 
-        // BATCH번 시도
         for _ in 0..BATCH {
             executor.reset_last_crash();
 
-            let fuzz_result = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
+            // fuzz_one 반환: Result<_, libafl::Error> or libafl_bolts::Error
+            // -> BoxError로 변환
+            let fuzz_result = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+
             if let Err(e) = fuzz_result {
-                // crash 검출?
                 if let Some((crash_name, _is_unique, crash_count)) = executor.take_last_crash() {
                     eprintln!(
                         "[Thread {thread_id}] Duplicate crash {crash_name:?} (count={crash_count})"
                     );
-                    // 굳이 corpus에서 discard할 필요가 있으면 이 스레드 로컬 corpus 내 로직 가능
-                    // 여기서는 단순 로그만
                     break;
                 } else {
-                    return Err(Box::new(e));
+                    return Err(e);
                 }
             }
 
-            // crash?
+            // Crash?
             if let Some((crash_name, is_unique, crash_count)) = executor.take_last_crash() {
                 println!(
                     "[Thread {thread_id}] Crash name: {:?}, total count = {}",
                     crash_name, crash_count
                 );
                 if is_unique || crash_count > MAX_CRASHES {
-                    println!(
-                        "[Thread {thread_id}] (optional) Discarding after crash... (not implemented)"
-                    );
+                    println!("[Thread {thread_id}] Possibly discarding after crash...");
                 }
                 break;
             }
 
-            // coverage update
+            // coverage
             let hits = executor.hit_offsets();
             let mut newly_found = 0;
             {
@@ -213,6 +210,27 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
             }
             if newly_found > 0 {
                 GLOBAL_UNIQUE_OFFSETS.fetch_add(newly_found, Ordering::Relaxed);
+                // 현재 testcase가 새 coverage 경로. => unique 폴더에 저장
+                if let Some(cid_ref) = state.corpus().current() {
+                    let cid = *cid_ref; // &CorpusId -> CorpusId
+                    if let Ok(tc) = state.corpus().get(cid) {
+                        if let Some(input) = tc.borrow().input() {
+                            let data = input.as_ref();
+                            let mut hasher = AHasher::default();
+                            data.hash(&mut hasher);
+                            let fp = hasher.finish();
+
+                            let file_path = shared_unique_dir.join(format!("unique_{:016x}", fp));
+                            if !file_path.exists() {
+                                fs::write(&file_path, data)?;
+                                println!(
+                                    "[Thread {thread_id}] Found new coverage, saved to {:?}",
+                                    file_path
+                                );
+                            }
+                        }
+                    }
+                }
             }
             executor.hit_offsets_mut().clear();
         }
@@ -220,7 +238,6 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
         let exec_after = *state.executions();
         GLOBAL_EXECS.fetch_add((exec_after - exec_before) as u64, Ordering::Relaxed);
 
-        // GLOBAL_MAX_THREAD_COV 갱신
         let total_cov = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
         let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
         while total_cov > prev
@@ -230,17 +247,50 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
         {
             prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
         }
+
+        // 주기적 동기화
+        let now = Instant::now();
+        if now.duration_since(last_sync).as_secs() >= SYNC_INTERVAL {
+            last_sync = now;
+            let new_count = sync_from_unique(&shared_unique_dir, &corpus_dir)?;
+            if new_count > 0 {
+                println!("[Thread {thread_id}] Merged {new_count} new seeds from unique_samples");
+                state
+                    .load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir.clone()])
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            }
+        }
     }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// 시드 폴더 동기화
+fn sync_from_unique(
+    unique_dir: &Path,
+    corpus_dir: &Path,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let mut added = 0;
+    for entry in fs::read_dir(unique_dir)? {
+        let entry = entry?;
+        let file_path = entry.path();
+        if file_path.is_file() {
+            let file_name = file_path.file_name().unwrap();
+            let target_path = corpus_dir.join(file_name);
+            if !target_path.exists() {
+                fs::copy(&file_path, &target_path)?;
+                added += 1;
+            }
+        }
+    }
+    Ok(added)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::parse();
 
     let corpus_path = config.corpus_path.clone();
-    let global_crashes_path = config.crashes_path.clone();
     let num_threads = config.forks;
 
-    // Step 1) 전체 corpus 파일 로딩
+    // 스캔
     let mut all_files = Vec::new();
     for entry in WalkDir::new(&corpus_path).into_iter().filter_map(|e| e.ok()) {
         if entry.file_type().is_file() {
@@ -249,22 +299,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!("[Main] Found {} files in corpus", all_files.len());
 
-    // Step 2) 셔플 + 분할
-    //  - 그냥 균등 분할. 추가적으로 slice_chunks 등 사용 가능
-    //  - 아래서는 단순 round robin 분배
-    use rand::prelude::*;
+    // 셔플 + partition
     let mut rng = thread_rng();
     all_files.shuffle(&mut rng);
-
     let mut partitions: Vec<Vec<PathBuf>> = vec![Vec::new(); num_threads];
     for (i, file_path) in all_files.into_iter().enumerate() {
         let idx = i % num_threads;
         partitions[idx].push(file_path);
     }
 
-    // Step 3) 스레드별로 corpus_dir, crashes_dir 준비
-    //  - 예: thread_{id}_input, thread_{id}_crashes
-    let mut threads = Vec::new();
+    // unique_samples 폴더
+    let unique_samples_dir = PathBuf::from("unique_samples");
+    fs::create_dir_all(&unique_samples_dir)?;
+
+    // tinyinst, target args
     let mut tinyinst_args = vec![
         "-instrument_module".to_string(),
         config.tinyinst_module.clone(),
@@ -276,41 +324,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut target_args = vec![config.target.to_string_lossy().into_owned()];
     target_args.extend(config.target_args.clone());
 
+    // 쓰레드 스폰
+    let mut handles = Vec::new();
     for thread_id in 0..num_threads {
         let thread_input_dir = format!("thread_{thread_id}_input");
         let thread_crash_dir = format!("thread_{thread_id}_crashes");
 
-        // 폴더 생성
-        std::fs::create_dir_all(&thread_input_dir)?;
-        std::fs::create_dir_all(&thread_crash_dir)?;
+        fs::create_dir_all(&thread_input_dir)?;
+        fs::create_dir_all(&thread_crash_dir)?;
 
-        // 해당 스레드가 담당하는 corpus 파일 복사(또는 symlink)
-        // 여기서는 간단히 복사
+        // 분할된 파일 복사
         for file_path in &partitions[thread_id] {
             let filename = file_path.file_name().unwrap();
             let target = Path::new(&thread_input_dir).join(filename);
-
-            // 만약 크기가 큰 파일이 많다면 symlink를 권장
-            // 여기서는 예제 상 실제로 복사
-            std::fs::copy(file_path, &target)?;
+            fs::copy(file_path, &target)?;
         }
 
-        // ThreadParam
         let param = ThreadParam {
             thread_id,
             corpus_dir: PathBuf::from(&thread_input_dir),
             crashes_dir: PathBuf::from(&thread_crash_dir),
+            shared_unique_dir: unique_samples_dir.clone(),
             tinyinst_args: tinyinst_args.clone(),
             target_args: target_args.clone(),
             timeout: config.timeout,
         };
 
-        // 스레드 스폰
         let handle = thread::spawn(move || fuzz_thread_main(param));
-        threads.push(handle);
+        handles.push(handle);
     }
 
-    // Step 4) stats thread
+    // Stats
     let stats_handle = thread::spawn(move || {
         let mut prev_execs = 0u64;
         let mut smoothed_speed = 0u64;
@@ -338,10 +382,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Step 5) workers join
-    for handle in threads {
+    // Worker join
+    for handle in handles {
         match handle.join() {
-            Ok(Ok(_)) => {}
+            Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 eprintln!("Worker error: {e}");
             }
@@ -351,7 +395,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 필요하다면 stats thread 종료 로직
     // stats_handle.join().unwrap();
 
     Ok(())

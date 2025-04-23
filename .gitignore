@@ -4,6 +4,7 @@ out
 Cargo.lock
 vendor
 thread*
+unique*
 
 .DS_Store
 .env

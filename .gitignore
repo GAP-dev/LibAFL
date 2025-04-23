@@ -3,7 +3,7 @@ target-bin
 out
 Cargo.lock
 vendor
-
+thread*
 
 .DS_Store
 .env

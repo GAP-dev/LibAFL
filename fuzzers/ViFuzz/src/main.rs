@@ -1,69 +1,77 @@
 use std::{
-    collections::{HashSet},
     fs,
-    hash::{Hash, Hasher},
-    path::PathBuf,
-    sync::{Arc, RwLock, Mutex},
-    thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::Duration,
 };
-
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use rand::thread_rng;
 use clap::Parser;
+use once_cell::sync::Lazy;
+use walkdir::WalkDir;
 use ahash::AHasher;
-
+use std::hash::{Hash, Hasher};
+use libafl_bolts::{rands::StdRand, tuples::tuple_list};
 use libafl::{
-    corpus::{InMemoryOnDiskCorpus, OnDiskCorpus, CorpusId, Testcase},
+    
+    corpus::{Corpus, InMemoryOnDiskCorpus, OnDiskCorpus, Testcase},
     events::SimpleEventManager,
+    feedback_or_fast,
     feedbacks::{CrashFeedback, MaxMapFeedback, TimeFeedback},
+    fuzzer::{Fuzzer, StdFuzzer},
     inputs::BytesInput,
     monitors::MultiMonitor,
-    mutators::{StdMOptMutator, havoc_mutations},
+    mutators::{havoc_mutations, StdMOptMutator},
     observers::{StdMapObserver, TimeObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
-    state::{StdState, HasCorpus},
-    state::HasExecutions,
-    feedback_or_fast,
-    Fuzzer, StdFuzzer,
+    state::{HasCorpus, HasExecutions, StdState},
 };
-use libafl::corpus::Corpus;
-use libafl_bolts::{rands::StdRand, tuples::tuple_list};
 use libafl_tinyinst::executor::TinyInstExecutor;
-use libafl::executors::ExitKind;
-use libafl::corpus::HasCurrentCorpusId;
-use walkdir::WalkDir;
-use rand::seq::SliceRandom;
-use rand::thread_rng;
 
-/// 커버리지 맵 크기
+/// TinyInst 커버리지 맵 크기 (u64 단위)
 const MAP_SIZE: usize = 65536;
-/// TinyInst gives byte‑level offsets; each u64 word covers 8 bytes.
+/// 바이트로 계산할 때
 const MAP_BYTES: usize = MAP_SIZE * 8;
 
-/// 한 번 잡은 코퍼스 입력에 대해 몇 번 Mutate+Execute 할지
-const BATCH: usize = 1000;
+/// 커버리지 보고를 위해 전역으로 보관
+static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_UNIQUE_OFFSETS: AtomicUsize = AtomicUsize::new(0);
 
-/// crash 횟수 임계값
+/// 전역 Set으로 새 오프셋 기록
+static GLOBAL_SHARED_OFFSETS: Lazy<Mutex<ahash::HashSet<u64>>> =
+    Lazy::new(|| Mutex::new(ahash::HashSet::default()));
+
+/// 최대 coverage count
+static GLOBAL_MAX_THREAD_COV: AtomicUsize = AtomicUsize::new(0);
+
+/// crash 횟수 제한
 const MAX_CRASHES: usize = 3;
 
-/// CLI 파싱용
+/// 각 스레드가 수행할 배치 (한 번 corpus 아이템 골랐을 때 몇 번 변이+실행)
+const BATCH: usize = 10;
+
 #[derive(Parser, Debug, Clone)]
 #[clap(author, version, about)]
 struct Config {
-    #[clap(long, value_parser, default_value = "../../corpus_discovered")]
+    /// 전체 corpus 경로
+    #[clap(long, value_parser, default_value = "./corpus")]
     corpus_path: PathBuf,
 
-    #[clap(long, value_parser, default_value = "./crashes")]
+    /// (Optional) Crash 아웃풋(전역) 저장 경로
+    #[clap(long, value_parser, default_value = "./crashes_all")]
     crashes_path: PathBuf,
 
-    #[clap(long, default_value_t = 1)]
+    /// 스레드(= 파티션) 개수
+    #[clap(long, default_value_t = 4)]
     forks: usize,
 
-    #[clap(long, default_value_t = 100)]
-    fuzz_iterations: usize,
-
-    #[clap(long, default_value_t = 4000)]
+    /// timeout(ms)
+    #[clap(long, default_value_t = 2000)]
     timeout: u64,
 
     #[clap(long, default_value = "ImageIO")]
@@ -72,412 +80,279 @@ struct Config {
     #[clap(long)]
     tinyinst_extra: Option<String>,
 
-    #[clap(long, value_parser)]
+    /// 타겟 실행 파일
+    #[clap(long, value_parser, default_value = "./target_app")]
     target: PathBuf,
 
+    /// 타겟에 넘길 인자
     #[clap(last = true)]
     target_args: Vec<String>,
 }
 
-/// 전역 counters for periodic statistics
-static GLOBAL_EXECS: AtomicU64 = AtomicU64::new(0);
-
-/// **신규로 발견된 offsets 총 개수** (전역 Set에서 완전히 처음 보는 offset만 카운팅)
-static GLOBAL_UNIQUE_OFFSETS: AtomicUsize = AtomicUsize::new(0);
-
-/// **전역으로 공유할 오프셋 Set** (디버깅+중복 여부 체크)
-static GLOBAL_SHARED_OFFSETS: Lazy<Mutex<HashSet<u64>>> = Lazy::new(|| Mutex::new(HashSet::new()));
-
-/// Maximum unique coverage offsets so far
-static GLOBAL_MAX_THREAD_COV: AtomicUsize = AtomicUsize::new(0);
-
-use once_cell::sync::Lazy;
-
-/// (Optional) 입력 통계
-#[derive(Default, Clone)]
-struct SampleStats {
-    num_runs: u64,
-    num_crashes: u64,
-    num_hangs: u64,
-    num_newcov: u64,
+/// worker 스레드 함수 파라미터
+#[derive(Clone)]
+struct ThreadParam {
+    thread_id: usize,
+    corpus_dir: PathBuf,  // 이 스레드만의 corpus 폴더
+    crashes_dir: PathBuf, // 이 스레드만의 crashes 폴더
+    tinyinst_args: Vec<String>,
+    target_args: Vec<String>,
+    timeout: u64,
 }
 
-/// 새로 만든 Round-Robin 형식의 공용 코퍼스
-struct SharedCorpus {
-    /// All inputs
-    all: Vec<BytesInput>,
-    /// Whether we've “removed” an input from the pool
-    discarded: Vec<bool>,
-    /// Simple coverage-hash set to avoid duplicates
-    fingerprints: HashSet<u64>,
-    /// Sample-level metadata (crash count, new coverage, etc.)
-    stats: Vec<SampleStats>,
+/// worker 스레드 메인
+fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ThreadParam {
+        thread_id,
+        corpus_dir,
+        crashes_dir,
+        tinyinst_args,
+        target_args,
+        timeout,
+    } = param;
 
-    /// Next index to pick in round-robin.  
-    next_idx: AtomicUsize,
-}
+    // (1) 커버리지 맵, Observers
+    let mut coverage_map = vec![0u64; MAP_SIZE];
+    let cov_ptr: *mut Vec<u64> = &mut coverage_map as *mut Vec<u64>;
+    // unsafe지만 실제 lifetime 맞춰서 사용
+    let map_observer = unsafe { StdMapObserver::new("tinyinst_map", &mut coverage_map) };
+    let time_observer = TimeObserver::new("time_observer");
 
-impl SharedCorpus {
-    fn new() -> Self {
-        Self {
-            all: Vec::new(),
-            discarded: Vec::new(),
-            fingerprints: HashSet::new(),
-            stats: Vec::new(),
-            next_idx: AtomicUsize::new(0),
-        }
-    }
+    // (2) Feedback, Objective
+    let map_feedback = MaxMapFeedback::new(&map_observer);
+    let mut feedback = feedback_or_fast!(map_feedback, TimeFeedback::new(&time_observer));
+    let mut objective = CrashFeedback::new();
 
-    /// 새 테스트케이스 추가
-    fn push(&mut self, input: BytesInput, cov_hash: u64) {
-        if self.fingerprints.contains(&cov_hash) {
-            return;
-        }
-        self.fingerprints.insert(cov_hash);
+    // (3) State
+    let rand = StdRand::with_seed(thread_id as u64 + 12345);
+    let mut state = StdState::new(
+        rand,
+        // 이 스레드 전용 corpus 폴더
+        InMemoryOnDiskCorpus::<BytesInput>::new(corpus_dir.clone())?,
+        // 이 스레드 전용 crash 폴더
+        OnDiskCorpus::<BytesInput>::new(crashes_dir.clone())?,
+        &mut feedback,
+        &mut objective,
+    )?;
 
-        self.all.push(input);
-        self.discarded.push(false);
-        self.stats.push(SampleStats::default());
-    }
+    // (4) Fuzzer
+    let scheduler = QueueScheduler::new();
+    let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
 
-    /// Round-robin으로 job 하나 꺼내기.  
-    /// all.len() * 2 번 정도 시도 후, discard 아닌 것을 찾지 못하면 `None`.
-    fn pop_job(&self) -> Option<usize> {
-        let total = self.all.len();
-        if total == 0 {
-            return None;
-        }
-        for _attempts in 0..(total * 2) {
-            let idx = self.next_idx.fetch_add(1, Ordering::Relaxed) % total;
-            if !self.discarded[idx] {
-                return Some(idx);
+    // (5) Event manager
+    let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
+
+    // (6) TinyInstExecutor (Persistent 모드 예시)
+    let mut executor = TinyInstExecutor::builder()
+        .tinyinst_args(tinyinst_args)
+        .program_args(target_args)
+        .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 1_000_000)
+        .timeout(Duration::from_millis(timeout))
+        .coverage_ptr(cov_ptr)
+        .build(tuple_list!(map_observer, time_observer))?;
+
+    // (7) corpus load
+    let _ = state.load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir]);
+
+    // (8) Mutator
+    let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5)?;
+    let mut stages = tuple_list!(StdMutationalStage::new(mopt));
+
+    // (9) fuzz loop
+    loop {
+        // 스케줄러가 pick할 아이템(로컬 corpus에서)
+        // 한 아이템에 대해 BATCH번 변이+실행
+        // libafl의 fuzz_one()은 자동으로 state.corpus().current()를 고릅니다
+        // QueueScheduler는 round-robin 등등
+
+        let exec_before = *state.executions();
+
+        // BATCH번 시도
+        for _ in 0..BATCH {
+            executor.reset_last_crash();
+
+            let fuzz_result = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
+            if let Err(e) = fuzz_result {
+                // crash 검출?
+                if let Some((crash_name, _is_unique, crash_count)) = executor.take_last_crash() {
+                    eprintln!(
+                        "[Thread {thread_id}] Duplicate crash {crash_name:?} (count={crash_count})"
+                    );
+                    // 굳이 corpus에서 discard할 필요가 있으면 이 스레드 로컬 corpus 내 로직 가능
+                    // 여기서는 단순 로그만
+                    break;
+                } else {
+                    return Err(Box::new(e));
+                }
             }
+
+            // crash?
+            if let Some((crash_name, is_unique, crash_count)) = executor.take_last_crash() {
+                println!(
+                    "[Thread {thread_id}] Crash name: {:?}, total count = {}",
+                    crash_name, crash_count
+                );
+                if is_unique || crash_count > MAX_CRASHES {
+                    println!(
+                        "[Thread {thread_id}] (optional) Discarding after crash... (not implemented)"
+                    );
+                }
+                break;
+            }
+
+            // coverage update
+            let hits = executor.hit_offsets();
+            let mut newly_found = 0;
+            {
+                let mut global_offs = GLOBAL_SHARED_OFFSETS.lock().unwrap();
+                for &off in hits {
+                    if global_offs.insert(off) {
+                        newly_found += 1;
+                    }
+                }
+            }
+            if newly_found > 0 {
+                GLOBAL_UNIQUE_OFFSETS.fetch_add(newly_found, Ordering::Relaxed);
+            }
+            executor.hit_offsets_mut().clear();
         }
-        None
-    }
 
-    /// discard
-    fn discard(&mut self, idx: usize) {
-        if idx < self.discarded.len() {
-            self.discarded[idx] = true;
+        let exec_after = *state.executions();
+        GLOBAL_EXECS.fetch_add((exec_after - exec_before) as u64, Ordering::Relaxed);
+
+        // GLOBAL_MAX_THREAD_COV 갱신
+        let total_cov = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
+        let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+        while total_cov > prev
+            && GLOBAL_MAX_THREAD_COV
+                .compare_exchange_weak(prev, total_cov, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
         }
-    }
-
-    fn stats(&self) -> (usize, usize) {
-        let discarded_count = self.discarded.iter().filter(|x| **x).count();
-        (self.all.len(), discarded_count)
-    }
-}
-
-/// 스레드 로컬 컨텍스트
-struct ThreadContext {
-    id: usize,
-    shared: Arc<RwLock<SharedCorpus>>,
-    local_len: usize, // local cache: how many inputs we have so far
-}
-
-impl ThreadContext {
-    fn new(id: usize, shared: Arc<RwLock<SharedCorpus>>) -> Self {
-        Self {
-            id,
-            shared,
-            local_len: 0,
-        }
-    }
-
-    /// 새롭게 추가된 input이 있으면 local_len에 반영
-    fn synchronize(&mut self) {
-        let sh_read = self.shared.read().unwrap();
-        if sh_read.all.len() > self.local_len {
-            self.local_len = sh_read.all.len();
-        }
-    }
-
-    /// round-robin pop
-    fn get_job(&self) -> Option<usize> {
-        let sh = self.shared.read().unwrap();
-        sh.pop_job()
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::parse();
 
-    let corpus_path   = config.corpus_path.clone();
-    let crashes_path  = config.crashes_path.clone();
-    let num_threads   = config.forks;
-    let tinyinst_args = {
-        let mut v = vec![
-            "-instrument_module".into(),
-            config.tinyinst_module.clone(),
-            "-generate_unwind".into(),
-        ];
-        if let Some(x) = &config.tinyinst_extra {
-            v.push(x.clone());
+    let corpus_path = config.corpus_path.clone();
+    let global_crashes_path = config.crashes_path.clone();
+    let num_threads = config.forks;
+
+    // Step 1) 전체 corpus 파일 로딩
+    let mut all_files = Vec::new();
+    for entry in WalkDir::new(&corpus_path).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            all_files.push(entry.path().to_path_buf());
         }
-        v
-    };
+    }
+    println!("[Main] Found {} files in corpus", all_files.len());
+
+    // Step 2) 셔플 + 분할
+    //  - 그냥 균등 분할. 추가적으로 slice_chunks 등 사용 가능
+    //  - 아래서는 단순 round robin 분배
+    use rand::prelude::*;
+    let mut rng = thread_rng();
+    all_files.shuffle(&mut rng);
+
+    let mut partitions: Vec<Vec<PathBuf>> = vec![Vec::new(); num_threads];
+    for (i, file_path) in all_files.into_iter().enumerate() {
+        let idx = i % num_threads;
+        partitions[idx].push(file_path);
+    }
+
+    // Step 3) 스레드별로 corpus_dir, crashes_dir 준비
+    //  - 예: thread_{id}_input, thread_{id}_crashes
+    let mut threads = Vec::new();
+    let mut tinyinst_args = vec![
+        "-instrument_module".to_string(),
+        config.tinyinst_module.clone(),
+        "-generate_unwind".to_string(),
+    ];
+    if let Some(extra) = config.tinyinst_extra.clone() {
+        tinyinst_args.push(extra);
+    }
     let mut target_args = vec![config.target.to_string_lossy().into_owned()];
     target_args.extend(config.target_args.clone());
 
-    // Prepare shared corpus
-    let shared = Arc::new(RwLock::new(SharedCorpus::new()));
-    {
-        let mut sh = shared.write().unwrap();
-        for entry in WalkDir::new(&corpus_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path().to_path_buf();
-            if path.is_file() {
-                if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                    if fname.starts_with('.') {
-                        continue;
-                    }
-                }
-                if let Ok(data) = fs::read(&path) {
-                    let mut hasher = AHasher::default();
-                    data.hash(&mut hasher);
-                    let fp = hasher.finish();
-                    sh.push(BytesInput::new(data), fp);
-                }
+    for thread_id in 0..num_threads {
+        let thread_input_dir = format!("thread_{thread_id}_input");
+        let thread_crash_dir = format!("thread_{thread_id}_crashes");
+
+        // 폴더 생성
+        std::fs::create_dir_all(&thread_input_dir)?;
+        std::fs::create_dir_all(&thread_crash_dir)?;
+
+        // 해당 스레드가 담당하는 corpus 파일 복사(또는 symlink)
+        // 여기서는 간단히 복사
+        for file_path in &partitions[thread_id] {
+            let filename = file_path.file_name().unwrap();
+            let target = Path::new(&thread_input_dir).join(filename);
+
+            // 만약 크기가 큰 파일이 많다면 symlink를 권장
+            // 여기서는 예제 상 실제로 복사
+            std::fs::copy(file_path, &target)?;
+        }
+
+        // ThreadParam
+        let param = ThreadParam {
+            thread_id,
+            corpus_dir: PathBuf::from(&thread_input_dir),
+            crashes_dir: PathBuf::from(&thread_crash_dir),
+            tinyinst_args: tinyinst_args.clone(),
+            target_args: target_args.clone(),
+            timeout: config.timeout,
+        };
+
+        // 스레드 스폰
+        let handle = thread::spawn(move || fuzz_thread_main(param));
+        threads.push(handle);
+    }
+
+    // Step 4) stats thread
+    let stats_handle = thread::spawn(move || {
+        let mut prev_execs = 0u64;
+        let mut smoothed_speed = 0u64;
+        const ALPHA: f64 = 0.2;
+
+        loop {
+            thread::sleep(Duration::from_secs(1));
+
+            let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
+            let speed = execs - prev_execs;
+            smoothed_speed =
+                ((speed as f64) * ALPHA + (smoothed_speed as f64) * (1.0 - ALPHA)).round() as u64;
+            prev_execs = execs;
+
+            let offsets_set_size = {
+                let set = GLOBAL_SHARED_OFFSETS.lock().unwrap();
+                set.len()
+            };
+            let max_cov = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
+
+            println!(
+                "[Stats] coverage {:>8}, exec/s {:>10} (avg {:>10}), total_execs {:>12}, maxcov={}",
+                offsets_set_size, speed, smoothed_speed, execs, max_cov
+            );
+        }
+    });
+
+    // Step 5) workers join
+    for handle in threads {
+        match handle.join() {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                eprintln!("Worker error: {e}");
+            }
+            Err(e) => {
+                eprintln!("Worker panicked: {:?}", e);
             }
         }
     }
 
-    println!("[ViFuzz] Initial corpus count = {}", shared.read().unwrap().all.len());
-
-    let mut handles: Vec<JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>> = Vec::new();
-    for thread_id in 0..num_threads {
-        let shared       = shared.clone();
-        let tinyinst_args = tinyinst_args.clone();
-        let target_args  = target_args.clone();
-        let timeout      = config.timeout;
-        let corpus_dir   = corpus_path.clone();
-        let crashes_dir  = crashes_path.clone();
-
-        handles.push(thread::spawn(move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            let mut coverage_map = vec![0u64; MAP_SIZE];
-            let cov_ptr: *mut Vec<u64> = &mut coverage_map as *mut Vec<u64>;
-            let map_observer  = unsafe { StdMapObserver::new("cov", &mut coverage_map) };
-            let time_observer = TimeObserver::new("time");
-
-            let map_feedback = MaxMapFeedback::new(&map_observer);
-            let mut feedback = feedback_or_fast!(map_feedback, TimeFeedback::new(&time_observer));
-            let mut objective = CrashFeedback::new();
-
-            let rand = StdRand::new();
-            let mut state = StdState::new(
-                rand.clone(),
-                InMemoryOnDiskCorpus::<BytesInput>::new(corpus_dir.clone())?,
-                OnDiskCorpus::<BytesInput>::new(crashes_dir.clone())?,
-                &mut feedback,
-                &mut objective,
-            )?;
-
-            let scheduler = QueueScheduler::new();
-            let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
-            let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
-
-            let mut executor = TinyInstExecutor::builder()
-                .tinyinst_args(tinyinst_args)
-                .program_args(target_args)
-                .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 1000000)
-                .timeout(Duration::from_millis(timeout))
-                .coverage_ptr(cov_ptr)
-                .build(tuple_list!(map_observer, time_observer))?;
-
-            // pre-load corpus
-            let _ = state.load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir.clone()]);
-
-            let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5)?;
-            let mut stages = tuple_list!(StdMutationalStage::new(mopt));
-
-            let mut ctx = ThreadContext::new(thread_id, shared);
-            loop {
-                ctx.synchronize();
-                if let Some(idx) = ctx.get_job() {
-                    // Ensure we have that sample in our local corpus
-                    let input_bytes = {
-                        let sh = ctx.shared.read().unwrap();
-                        sh.all[idx].clone()
-                    };
-
-                    // Insert or find in local state corpus
-                    let corpus_id = {
-                        // Check if already in local corpus
-                        let mut found = None;
-                        for id in state.corpus().ids() {
-                            if let Ok(cell) = state.corpus().get(id) {
-                                if let Some(inp) = cell.borrow().input() {
-                                    if inp.as_ref() == input_bytes.as_ref() {
-                                        found = Some(id);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        match found {
-                            Some(id) => id,
-                            None => {
-                                let id = state
-                                    .corpus_mut()
-                                    .add(Testcase::new(input_bytes.clone()))
-                                    .unwrap();
-                                id
-                            }
-                        }
-                    };
-                    state.set_corpus_id(corpus_id)?;
-
-                    // Do BATCH fuzz calls
-                    for _i in 0..BATCH {
-                        executor.reset_last_crash();
-                        let exec_before = *state.executions();
-
-                        // fuzz_one
-                        let fuzz_res = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
-                        if let Err(err) = fuzz_res {
-                            if let Some((crash_name, _is_unique, crash_count)) = executor.take_last_crash() {
-                                eprintln!(
-                                    "[Thread {}] Duplicate crash {:?} (count={}), discarding sample {}",
-                                    thread_id, crash_name, crash_count, idx
-                                );
-                                let mut sh = ctx.shared.write().unwrap();
-                                sh.discard(idx);
-                                // Stop further fuzzing of this sample
-                                break;
-                            } else {
-                                return Err(Box::new(err));
-                            }
-                        }
-
-                        // Even if fuzz_one returned Ok, check if we got a new crash
-                        if let Some((crash_name, is_unique, crash_count)) = executor.take_last_crash() {
-                            println!("Crash name: {:?}, total count = {}", crash_name, crash_count);
-                            if is_unique || crash_count > MAX_CRASHES {
-                                println!(
-                                    "[ViFuzz] Discarding sample {} after crash in thread {}",
-                                    idx, thread_id
-                                );
-                                let mut sh = ctx.shared.write().unwrap();
-                                sh.discard(idx);
-                            }
-                            // Move on to next sample
-                            break;
-                        }
-
-                        GLOBAL_EXECS.fetch_add((*state.executions() - exec_before) as u64, Ordering::Relaxed);
-
-                        // Coverage analysis
-                        let hits = executor.hit_offsets();
-                        let mut newly_found = 0;
-                        {
-                            let mut global_offs = GLOBAL_SHARED_OFFSETS.lock().unwrap();
-                            for &off in hits {
-                                if global_offs.insert(off) {
-                                    newly_found += 1;
-                                }
-                            }
-                        }
-                        if newly_found > 0 {
-                            GLOBAL_UNIQUE_OFFSETS.fetch_add(newly_found, Ordering::Relaxed);
-                        }
-                        executor.hit_offsets_mut().clear();
-
-                        let len = GLOBAL_UNIQUE_OFFSETS.load(Ordering::Relaxed);
-                        let mut prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed);
-                        while len > prev
-                            && GLOBAL_MAX_THREAD_COV
-                                .compare_exchange_weak(
-                                    prev,
-                                    len,
-                                    Ordering::Relaxed,
-                                    Ordering::Relaxed
-                                )
-                                .is_err()
-                        {
-                            prev = GLOBAL_MAX_THREAD_COV.load(Ordering::Relaxed)
-                        }
-                    }
-
-                    // Check if we appended a new testcase to local corpus
-                    let after = state.corpus().count();
-                    if after > 0 {
-                        let new_id = after - 1;
-                        let bytes_vec_opt = state
-                            .corpus()
-                            .get(CorpusId(new_id))
-                            .ok()
-                            .and_then(|cell| {
-                                cell.borrow().input().as_ref().map(|inp| inp.as_ref().to_vec())
-                            });
-                        if let Some(bytes_vec) = bytes_vec_opt {
-                            let mut hasher = AHasher::default();
-                            bytes_vec.hash(&mut hasher);
-                            let sample_fp = hasher.finish();
-
-                            let mut sh = ctx.shared.write().unwrap();
-                            sh.push(BytesInput::new(bytes_vec), sample_fp);
-                        }
-                    }
-
-                } else {
-                    // No jobs available
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }));
-    }
-
-    // Stats thread
-    let stats_handle = {
-        let shared_stats = shared.clone();
-        thread::spawn(move || {
-            let mut prev_execs = 0u64;
-            let mut smoothed_speed = 0u64;
-            const ALPHA: f64 = 0.2;
-            loop {
-                thread::sleep(Duration::from_secs(1));
-                let execs = GLOBAL_EXECS.load(Ordering::Relaxed);
-                let speed = execs - prev_execs;
-                smoothed_speed = ((speed as f64) * ALPHA
-                                  + (smoothed_speed as f64) * (1.0 - ALPHA))
-                                 .round() as u64;
-                prev_execs = execs;
-
-                let (total_samples, discarded_samples) = {
-                    let sh = shared_stats.read().unwrap();
-                    sh.stats()
-                };
-                let offsets_set_size = {
-                    let set = GLOBAL_SHARED_OFFSETS.lock().unwrap();
-                    set.len()
-                };
-
-                println!(
-                    "[ViFuzz] coverage {:>8}, samples {:>6} (discarded {:>6}), \
-                     exec/s {:>10} (avg {:>10}), total_execs {:>12}",
-                    offsets_set_size,
-                    total_samples,
-                    discarded_samples,
-                    speed,
-                    smoothed_speed,
-                    execs
-                );
-            }
-        })
-    };
-
-    // Wait for fuzz threads
-    for handle in handles {
-        let thr_res = handle.join()
-            .map_err(|e| format!("thread panicked: {:?}", e))?;
-        thr_res;
-    }
-
-    // stats_handle.join().unwrap(); // If you ever want to terminate
+    // 필요하다면 stats thread 종료 로직
+    // stats_handle.join().unwrap();
 
     Ok(())
 }

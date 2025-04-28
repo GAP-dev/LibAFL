@@ -29,7 +29,8 @@ use libafl::{
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::BytesInput,
     monitors::MultiMonitor,
-    mutators::{havoc_mutations, StdMOptMutator},
+    mutators::{havoc_mutations, StdMOptMutator, BytesSetMutator, ByteIncMutator},
+    mutators::scheduled::StdScheduledMutator,
     observers::{StdMapObserver, TimeObserver},
     schedulers::QueueScheduler,
     stages::mutational::StdMutationalStage,
@@ -156,10 +157,20 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
         .load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[corpus_dir.clone()])
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-    // Mutator
-    let mopt = StdMOptMutator::new(&mut state, havoc_mutations(), 7, 5)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    let mut stages = tuple_list!(StdMutationalStage::new(mopt));
+    // Mutational pipeline: deterministic stage then havoc stage via StdScheduledMutator
+    // 1) Deterministic mutator scheduler
+    let det_sched = StdScheduledMutator::new(tuple_list!(
+        BytesSetMutator::new(),      // 삽입/삭제
+        ByteIncMutator::new()        // interesting-value 덮어쓰기
+    ));
+    let det_stage = StdMutationalStage::new(det_sched);
+
+    // 2) Havoc mutator scheduler
+    let havoc_sched = StdScheduledMutator::new(havoc_mutations());
+    let havoc_stage = StdMutationalStage::new(havoc_sched);
+
+    // Combine stages: deterministic first, then havoc
+    let mut stages = tuple_list!(det_stage, havoc_stage);
 
     let mut last_sync = Instant::now();
 

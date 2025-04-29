@@ -5,7 +5,8 @@ Cargo.lock
 vendor
 thread*
 unique*
-
+global_queue
+corpus*
 .DS_Store
 .env
 .vscode

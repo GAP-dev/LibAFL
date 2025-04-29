@@ -46,6 +46,7 @@ def run_litecov_single(input_file):
         LITECOV_PATH,
         "-generate_unwind",
         "-instrument_module", "ImageIO",
+        "-cmp_coverage",
         "-coverage_file", coverage_file,
         "--",
         TARGET_BIN,

@@ -13,7 +13,8 @@ def run_rust_fuzzer(show_raw_output=False, run_duration=1800):
         "--target", "/Users/gap_dev/fuzz_jack/Jackalope/build/examples/ImageIO/Release/test_imageio",
         "--corpus-path", "./corpus_discovered",
         "--crashes-path", "./crashes",
-        "--forks", "10",
+        "--forks", "3",
+
     ]
     
     # 타깃 인자: 옵션 이후의 위치 인자로 전달합니다.

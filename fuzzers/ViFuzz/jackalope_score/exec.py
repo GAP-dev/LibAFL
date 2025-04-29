@@ -21,8 +21,9 @@ def run_jackalope_fuzzer(show_raw_output=False, run_duration=1800):
         "-iterations", "1000000",
         "-persist",
         "-loop",
-        "-nthreads", "10",
+        "-nthreads", "3",
         "-nargs", "1",
+        "-cmp_coverage",
         "-generate_unwind"
 
     ]

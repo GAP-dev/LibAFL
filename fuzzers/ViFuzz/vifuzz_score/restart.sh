@@ -4,3 +4,4 @@ sudo cp -r ../main/corpus corpus_discovered
 sudo mkdir crashes
 sudo rm -rf thread_*
 sudo rm -rf unique_*
+sudo rm -rf global_queue

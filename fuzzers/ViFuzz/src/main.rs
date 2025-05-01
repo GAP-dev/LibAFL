@@ -2,6 +2,7 @@ use std::{
     fs,
     io,
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex,
@@ -16,7 +17,6 @@ use walkdir::WalkDir;
 
 // rand
 use rand::prelude::*;
-use rand::thread_rng;
 use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 
@@ -30,7 +30,7 @@ use libafl::{
     fuzzer::{Fuzzer, StdFuzzer},
     inputs::BytesInput,
     monitors::MultiMonitor,
-    mutators::{havoc_mutations, BytesSetMutator, ByteIncMutator, StdMOptMutator},
+    mutators::{havoc_mutations, BytesSetMutator, ByteIncMutator},
     mutators::scheduled::StdScheduledMutator,
     observers::{StdMapObserver, TimeObserver},
     schedulers::QueueScheduler,
@@ -66,6 +66,9 @@ const BATCH: usize = 10;
 
 /// 스레드 간 시드 공유 주기(초)
 const SYNC_INTERVAL: u64 = 5;
+
+/// 커버리지 정체(plateau)를 몇 배치 연속으로 감지하면 업데이트 시도할지
+const PLATEAU_LIMIT: usize = 5;
 
 #[derive(Parser, Debug, Clone)]
 struct Config {
@@ -155,6 +158,23 @@ fn sync_global_to_local(
     Ok(synced)
 }
 
+/// harness_update.py를 실행해 새 타깃 바이너리 경로를 받아온다.
+/// 파이썬 스크립트가 stdout에 "/path/to/new_binary" 같은 문자열을 찍는다고 가정.
+fn get_harness_update() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let output = Command::new("python3")
+        .arg("harness_update.py")
+        .output()?;
+    if !output.status.success() {
+        return Err("harness_update.py failed".into());
+    }
+    // 예: "/absolute/path/to/new_target\n"
+    let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path_str.is_empty() {
+        return Err("harness_update.py returned empty path".into());
+    }
+    Ok(PathBuf::from(path_str))
+}
+
 /// 스레드 메인 루프
 fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ThreadParam {
@@ -170,6 +190,7 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
     // Observers
     let mut coverage_map = vec![0u64; MAP_SIZE];
     let cov_ptr: *mut Vec<u64> = &mut coverage_map as *mut Vec<u64>;
+    // unsafe 블록은 원래 코드대로 둡니다.
     let map_observer = unsafe { StdMapObserver::new("tinyinst_map", &mut coverage_map) };
     let time_observer = TimeObserver::new("time_observer");
 
@@ -182,39 +203,32 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
     let rand = StdRand::with_seed(thread_id as u64 + 12345);
 
     // Corpus
-    let inmem = InMemoryOnDiskCorpus::<BytesInput>::new(local_corpus_dir.clone())
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-    let ondisk = OnDiskCorpus::<BytesInput>::new(crashes_dir.clone())
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let inmem = InMemoryOnDiskCorpus::<BytesInput>::new(local_corpus_dir.clone())?;
+    let ondisk = OnDiskCorpus::<BytesInput>::new(crashes_dir.clone())?;
 
-    let mut state = StdState::new(rand, inmem, ondisk, &mut feedback, &mut objective)
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    let mut state = StdState::new(rand, inmem, ondisk, &mut feedback, &mut objective)?;
 
     // Fuzzer
     let scheduler = QueueScheduler::new();
     let mut fuzzer = StdFuzzer::new(scheduler, feedback, objective);
     let mut mgr = SimpleEventManager::new(MultiMonitor::new(|_s| {}));
 
-    // TinyInstExecutor
+    // TinyInstExecutor (초기 빌드)
     let mut executor = TinyInstExecutor::builder()
-        .tinyinst_args(tinyinst_args)
-        .program_args(target_args)
+        .tinyinst_args(tinyinst_args.clone())
+        .program_args(target_args.clone())
         .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 1_000_000)
         .timeout(Duration::from_millis(timeout))
         .coverage_ptr(cov_ptr)
-        .build(tuple_list!(map_observer, time_observer))
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        .build(tuple_list!(map_observer.clone(), time_observer.clone()))?;
 
     // 로컬 corpus load
-    state
-        .load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[local_corpus_dir.clone()])
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+    state.load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[local_corpus_dir.clone()])?;
 
     // Mutational pipeline
     let det_sched = StdScheduledMutator::new(tuple_list!(
-        BytesSetMutator::new(), // 삽입/삭제
-        ByteIncMutator::new()   // interesting-value 덮어쓰기
-        // 필요하다면 StdMOptMutator 등 추가 가능
+        BytesSetMutator::new(),
+        ByteIncMutator::new()
     ));
     let det_stage = StdMutationalStage::new(det_sched);
 
@@ -224,17 +238,17 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
     let mut stages = tuple_list!(det_stage, havoc_stage);
 
     let mut last_sync = Instant::now();
+    let mut no_new_cov_batches = 0; // 연속으로 coverage가 하나도 증가하지 않은 배치 수
 
     loop {
         let exec_before = *state.executions();
+        let mut batch_found_cov = 0; // 이번 BATCH 동안 newly_found 총합
 
         // BATCH만큼 테스트
         for _ in 0..BATCH {
             executor.reset_last_crash();
 
-            let fuzz_result = fuzzer
-                .fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+            let fuzz_result = fuzzer.fuzz_one(&mut stages, &mut executor, &mut state, &mut mgr);
 
             if let Err(e) = fuzz_result {
                 if let Some((crash_name, _is_unique, crash_count)) = executor.take_last_crash() {
@@ -243,7 +257,7 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
                     );
                     break;
                 } else {
-                    return Err(e);
+                    return Err(e.into());
                 }
             }
 
@@ -271,6 +285,7 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
                 }
             }
             let newly_found = newly_found_offsets.len();
+            batch_found_cov += newly_found;
             if newly_found > 0 {
                 // 통계용으로 기록
                 {
@@ -289,8 +304,7 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
                             data.hash(&mut hasher);
                             let fp = hasher.finish();
 
-                            let file_path =
-                                local_corpus_dir.join(format!("cov_{:016x}", fp));
+                            let file_path = local_corpus_dir.join(format!("cov_{:016x}", fp));
                             if !file_path.exists() {
                                 fs::write(&file_path, data)?;
                                 println!(
@@ -303,6 +317,64 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
                 }
             }
             executor.hit_offsets_mut().clear();
+        }
+
+        // 배치 끝난 후 coverage 정체 여부 갱신
+        if batch_found_cov == 0 {
+            no_new_cov_batches += 1;
+        } else {
+            no_new_cov_batches = 0;
+        }
+
+        // 만약 몇 번 연속(예: 5번) 커버리지가 증가하지 않았다면 harness_update.py 호출
+        if no_new_cov_batches >= PLATEAU_LIMIT {
+            println!("[Thread {thread_id}] Coverage plateau detected. Trying harness_update.py...");
+            no_new_cov_batches = 0;
+
+            match get_harness_update() {
+                Ok(new_bin) => {
+                    println!(
+                        "[Thread {thread_id}] -> harness_update returned new binary: {:?}",
+                        new_bin
+                    );
+                    if new_bin.exists() {
+                        // 새 executor를 만들어 교체
+                        let new_args = {
+                            // 기존 인자에서 첫 번째(실행 바이너리)를 교체하거나,
+                            // 원하는 대로 조합해서 사용 가능
+                            let mut v = target_args.clone();
+                            if !v.is_empty() {
+                                v[0] = new_bin.to_string_lossy().into_owned();
+                            } else {
+                                v.insert(0, new_bin.to_string_lossy().into_owned());
+                            }
+                            v
+                        };
+
+                        // TinyInstExecutor 재생성
+                        executor = TinyInstExecutor::builder()
+                            .tinyinst_args(tinyinst_args.clone())
+                            .program_args(new_args)
+                            .persistent("test_imageio".to_string(), "_fuzz".to_string(), 1, 1_000_000)
+                            .timeout(Duration::from_millis(timeout))
+                            .coverage_ptr(cov_ptr)
+                            .build(tuple_list!(map_observer.clone(), time_observer.clone()))?;
+
+                        println!("[Thread {thread_id}] Executor has been rebuilt with new binary.");
+                    } else {
+                        eprintln!(
+                            "[Thread {thread_id}] New binary path does not exist: {:?}",
+                            new_bin
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[Thread {thread_id}] harness_update.py error: {}",
+                        e
+                    );
+                }
+            }
         }
 
         let exec_after = *state.executions();
@@ -335,9 +407,12 @@ fn fuzz_thread_main(param: ThreadParam) -> Result<(), Box<dyn std::error::Error 
                 println!("[Thread {thread_id}] Pulled {newly_synced2} seeds from global_queue.");
 
                 // 동기화 후 새로 로컬 폴더에 추가된 시드들을 다시 state에 load
-                state
-                    .load_initial_inputs_forced(&mut fuzzer, &mut executor, &mut mgr, &[local_corpus_dir.clone()])
-                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                state.load_initial_inputs_forced(
+                    &mut fuzzer,
+                    &mut executor,
+                    &mut mgr,
+                    &[local_corpus_dir.clone()]
+                )?;
             }
         }
     }
